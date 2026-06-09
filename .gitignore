@@ -27,7 +27,6 @@ uploads/
 # local project notes
 docs/
 
-# temperarily ignore README.md
-README.md
+# claude files
 CLAUDE.md
 .claude
