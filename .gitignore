@@ -1,0 +1,33 @@
+# virtual environments
+.venv/
+backend/.venv/
+venv/
+env/
+
+# environment files
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# local data / volumes
+data/
+postgres_data/
+redis_data/
+ollama_data/
+documents/
+uploads/
+
+# local project notes
+docs/
+
+# temperarily ignore README.md
+README.md
+CLAUDE.md
+.claude
