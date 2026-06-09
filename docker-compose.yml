@@ -1,0 +1,80 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: lfa-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ollama-model-init:
+    image: ollama/ollama:latest
+    container_name: lfa-ollama-model-init
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    command: ["pull", "tinyllama:latest"]
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lfa-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lfa
+      POSTGRES_USER: lfa
+      POSTGRES_PASSWORD: lfa_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-enable-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lfa -d lfa"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: lfa-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # rq-worker:
+  #   image: python:3.12-slim
+  #   container_name: lfa-rq-worker
+  #   profiles:
+  #     - worker
+  #   working_dir: /app
+  #   volumes:
+  #     - ./backend:/app
+  #   environment:
+  #     REDIS_URL: redis://redis:6379/0
+  #   depends_on:
+  #     - redis
+  #   command: >
+  #     sh -c "pip install --no-cache-dir rq redis
+  #     && rq worker --url $$REDIS_URL default"
+
+volumes:
+  ollama_data:
+  postgres_data:
+  redis_data:
