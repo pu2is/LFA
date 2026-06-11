@@ -22,7 +22,10 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
-    command: ["pull", "tinyllama:latest"]
+    # Default entrypoint is the ollama binary, which only takes one
+    # subcommand. Override with a shell to pull both models in sequence.
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull qwen2.5:3b && ollama pull bge-m3"]
 
   postgres:
     image: pgvector/pgvector:pg16

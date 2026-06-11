@@ -12,7 +12,8 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "tinyllama:latest"
+    ollama_model: str = "qwen2.5:3b"
+    ollama_embed_model: str = "bge-m3"
 
     model_config = SettingsConfigDict(
         env_file=".env",
