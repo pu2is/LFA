@@ -6,6 +6,6 @@ Users point the app at local folders, the LLM suggests labels for each document,
 
 ## Tech Stack
 
-- **Backend**: FastAPI, SQLAlchemy, PostgreSQL + pgvector, Redis + RQ, LangChain, Ollama (TinyLLaMA)
+- **Backend**: FastAPI, SQLAlchemy, PostgreSQL + pgvector, Redis + RQ, LangChain, Ollama
 - **Infrastructure**: Docker Compose (PostgreSQL, Redis, Ollama)
 - **Frontend**: React + Tailwind CSS _(planned)_
