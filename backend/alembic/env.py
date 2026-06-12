@@ -7,7 +7,8 @@ from alembic import context
 
 from app.shared.config import settings
 from app.shared.database import Base
-from app.modules.files import models  # noqa: F401 - registers RegisteredPath on Base.metadata
+from app.modules.files import models as files_models  # noqa: F401 - registers RegisteredPath on Base.metadata
+from app.modules.labeling import models as labeling_models  # noqa: F401 - registers Label on Base.metadata
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
