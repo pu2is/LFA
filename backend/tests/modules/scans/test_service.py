@@ -6,7 +6,7 @@ from sqlalchemy import delete, select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.scans.models import Scan
-from app.modules.scans.service import run_scan
+from app.modules.scans.service import create_scan, get_scan, run_scan
 
 TEST_DIR = Path("E:/lfa_test")
 
@@ -54,6 +54,27 @@ def test_run_scan_discovers_documents(db, registered_path):
         assert file.status == "discovered"
         assert file.file_size > 0
         assert len(file.file_hash) == 64
+
+
+def test_run_scan_updates_path_last_scanned_at(db, registered_path):
+    assert registered_path.last_scanned_at is None
+
+    scan = _queue_scan(db, registered_path.id)
+    run_scan(db, scan.id)
+
+    db.refresh(registered_path)
+    assert registered_path.last_scanned_at is not None
+
+
+def test_create_scan_starts_queued(db, registered_path):
+    scan = create_scan(db, registered_path.id)
+
+    assert scan.status == "queued"
+    assert get_scan(db, scan.id).id == scan.id
+
+
+def test_get_scan_returns_none_for_unknown_id(db):
+    assert get_scan(db, uuid.uuid4()) is None
 
 
 def test_rescan_is_idempotent(db, registered_path):

@@ -4,8 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.modules.files import service
-from app.modules.files.models import RegisteredPath
-from app.modules.files.schemas import PathCreate, PathRead
+from app.modules.files.models import File, RegisteredPath
+from app.modules.files.schemas import FileRead, PathCreate, PathRead
 from app.shared.database import get_db
 
 router = APIRouter(tags=["paths"])
@@ -32,3 +32,10 @@ def remove_path(path_id: uuid.UUID, db: Session = Depends(get_db)) -> PathRead:
     deleted = PathRead.model_validate(registered_path)
     service.delete_path(db, registered_path)
     return deleted
+
+
+@router.get("/files", response_model=list[FileRead])
+def list_files(path_id: uuid.UUID | None = None, db: Session = Depends(get_db)) -> list[File]:
+    if path_id is not None and service.get_path(db, path_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
+    return service.list_files(db, path_id)

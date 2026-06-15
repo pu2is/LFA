@@ -9,6 +9,18 @@ from app.modules.scans import discovery
 from app.modules.scans.models import Scan
 
 
+def create_scan(db: Session, path_id: uuid.UUID) -> Scan:
+    scan = Scan(path_id=path_id, status="queued")
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+    return scan
+
+
+def get_scan(db: Session, scan_id: uuid.UUID) -> Scan | None:
+    return db.get(Scan, scan_id)
+
+
 def run_scan(db: Session, scan_id: uuid.UUID) -> Scan:
     """Walk the scan's registered path and upsert a File row per supported document.
 
@@ -53,5 +65,6 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> Scan:
 
     scan.status = "completed"
     scan.completed_at = datetime.now(timezone.utc)
+    registered_path.last_scanned_at = scan.completed_at
     db.commit()
     return scan

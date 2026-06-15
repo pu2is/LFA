@@ -24,3 +24,21 @@ class PathRead(BaseModel):
     path: str
     created_at: datetime
     last_scanned_at: datetime | None
+
+
+class FileRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    path_id: uuid.UUID
+    filename: str
+    full_path: str
+    file_type: str
+    file_size: int
+    file_hash: str
+    ocr_applied: bool
+    file_created_at: datetime | None
+    file_modified_at: datetime
+    status: str
+    created_at: datetime
+    updated_at: datetime

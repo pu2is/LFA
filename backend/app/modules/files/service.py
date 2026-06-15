@@ -36,6 +36,13 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
     return db.scalar(select(File).where(File.full_path == full_path))
 
 
+def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[File]:
+    stmt = select(File)
+    if path_id is not None:
+        stmt = stmt.where(File.path_id == path_id)
+    return list(db.scalars(stmt))
+
+
 def upsert_file(
     db: Session,
     *,
