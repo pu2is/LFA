@@ -17,3 +17,9 @@ labeling_queue = Queue(
     name="labeling",
     connection=redis_connection,
 )
+
+# Job2: embed chunks via bge-m3 (lower priority — workers prefer labeling_queue)
+embedding_queue = Queue(
+    name="embedding",
+    connection=redis_connection,
+)
