@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.modules.files import service
-from app.modules.files.models import File, RegisteredPath
+from app.modules.files.models import RegisteredPath
 from app.modules.files.schemas import FileRead, PathCreate, PathRead
 from app.shared.database import get_db
 
@@ -35,7 +35,11 @@ def remove_path(path_id: uuid.UUID, db: Session = Depends(get_db)) -> PathRead:
 
 
 @router.get("/files", response_model=list[FileRead])
-def list_files(path_id: uuid.UUID | None = None, db: Session = Depends(get_db)) -> list[File]:
+def list_files(path_id: uuid.UUID | None = None, db: Session = Depends(get_db)) -> list[FileRead]:
     if path_id is not None and service.get_path(db, path_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
-    return service.list_files(db, path_id)
+    rows = service.list_files(db, path_id)
+    return [
+        FileRead.model_validate(file).model_copy(update={"processing_job_status": job_status})
+        for file, job_status in rows
+    ]

@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
+from app.modules.processing.models import ProcessingJob
 
 
 def get_path_by_value(db: Session, path: str) -> RegisteredPath | None:
@@ -36,11 +37,21 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
     return db.scalar(select(File).where(File.full_path == full_path))
 
 
-def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[File]:
-    stmt = select(File)
+def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File, str | None]]:
+    # Correlated scalar subquery: for each file row, grab the most recent job status.
+    # LEFT JOIN semantics: files with no jobs get NULL (→ None in Python).
+    latest_job_status = (
+        select(ProcessingJob.status)
+        .where(ProcessingJob.file_id == File.id)
+        .order_by(ProcessingJob.created_at.desc())
+        .limit(1)
+        .correlate(File)
+        .scalar_subquery()
+    )
+    stmt = select(File, latest_job_status.label("processing_job_status"))
     if path_id is not None:
         stmt = stmt.where(File.path_id == path_id)
-    return list(db.scalars(stmt))
+    return list(db.execute(stmt))
 
 
 def upsert_file(

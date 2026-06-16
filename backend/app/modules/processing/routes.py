@@ -1,6 +1,7 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from rq.job import Retry
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,6 +17,9 @@ from app.modules.processing.tasks import run_processing_job
 from app.shared.database import get_db
 from app.shared.queue import labeling_queue
 
+# Retry for resource errors (Ollama unreachable): 3 attempts, back-off 1 min / 2 min / 5 min.
+_RETRY = Retry(max=3, interval=[60, 120, 300])
+
 router = APIRouter(prefix="/process", tags=["processing"])
 
 
@@ -29,6 +33,7 @@ def process_files(payload: ProcessFilesByIdsRequest, db: Session = Depends(get_d
 
     Only creates jobs; the actual extract→chunk pipeline runs in the RQ worker.
     Returns 404 if any file_id is not found (validated before any job is created).
+    Files that are not in 'discovered' status are silently skipped.
     """
     files = []
     for file_id in payload.file_ids:
@@ -38,12 +43,13 @@ def process_files(payload: ProcessFilesByIdsRequest, db: Session = Depends(get_d
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"File {file_id} not found",
             )
-        files.append(file)
+        if file.status == "discovered":
+            files.append(file)
 
     jobs = []
     for file in files:
         job = service.create_processing_job(db, file.id, triggered_by="manual")
-        rq_job = labeling_queue.enqueue(run_processing_job, job.id)
+        rq_job = labeling_queue.enqueue(run_processing_job, job.id, retry=_RETRY)
         job.rq_job_id = str(rq_job.id)
         db.commit()
         db.refresh(job)
@@ -81,7 +87,7 @@ def process_paths(payload: ProcessByPathIdsRequest, db: Session = Depends(get_db
     jobs = []
     for file in files:
         job = service.create_processing_job(db, file.id, triggered_by="manual")
-        rq_job = labeling_queue.enqueue(run_processing_job, job.id)
+        rq_job = labeling_queue.enqueue(run_processing_job, job.id, retry=_RETRY)
         job.rq_job_id = str(rq_job.id)
         db.commit()
         db.refresh(job)
