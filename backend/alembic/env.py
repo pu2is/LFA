@@ -8,7 +8,9 @@ from alembic import context
 from app.shared.config import settings
 from app.shared.database import Base
 from app.modules.files import models as files_models  # noqa: F401 - registers RegisteredPath, File on Base.metadata
-from app.modules.labeling import models as labeling_models  # noqa: F401 - registers Label on Base.metadata
+from app.modules.labeling import models as labeling_models  # noqa: F401 - registers Label, FileLabel on Base.metadata
+from app.modules.processing import models as processing_models  # noqa: F401 - registers ProcessingJob on Base.metadata
+from app.modules.rag import models as rag_models  # noqa: F401 - registers FileChunk on Base.metadata
 from app.modules.scans import models as scans_models  # noqa: F401 - registers Scan on Base.metadata
 
 # this is the Alembic Config object, which provides

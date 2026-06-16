@@ -40,5 +40,6 @@ class FileRead(BaseModel):
     file_created_at: datetime | None
     file_modified_at: datetime
     status: str
+    embedding_status: str
     created_at: datetime
     updated_at: datetime

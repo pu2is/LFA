@@ -34,6 +34,8 @@ class File(Base):
     file_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     file_modified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String, default="discovered", server_default="discovered")
+    # Independent of files.status: Job2 (#10) fills in vectors without blocking labeling.
+    embedding_status: Mapped[str] = mapped_column(String, default="pending", server_default=text("'pending'"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
