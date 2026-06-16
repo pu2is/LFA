@@ -2,9 +2,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from langchain_core.language_models import BaseChatModel
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File
+from app.modules.labeling import service as labeling_service
 from app.modules.processing import cleaning, extraction
 from app.modules.processing.models import ProcessingJob
 from app.modules.rag import service as rag_service
@@ -22,11 +24,14 @@ def get_processing_job(db: Session, job_id: uuid.UUID) -> ProcessingJob | None:
     return db.get(ProcessingJob, job_id)
 
 
-def process_file(db: Session, job_id: uuid.UUID) -> ProcessingJob:
-    """Run extract → clean → chunk synchronously for the file attached to `job_id`.
+def process_file(
+    db: Session,
+    job_id: uuid.UUID,
+    llm: BaseChatModel | None = None,
+) -> ProcessingJob:
+    """Run extract → clean → chunk → label synchronously for the file attached to `job_id`.
 
-    Leaves the job at status "chunking" -- the labeling step (→ "succeeded")
-    is added in issue #8. OCR fallback for scanned PDFs is deferred to #7.
+    The llm parameter is injectable so tests can pass a mock without hitting Ollama.
     """
     job = db.get(ProcessingJob, job_id)
     if job is None:
@@ -62,6 +67,27 @@ def process_file(db: Session, job_id: uuid.UUID) -> ProcessingJob:
     db.commit()
 
     rag_service.chunk_and_store(db, file.id, cleaned_text)
+    db.commit()
+
+    job.status = "labeling"
+    db.commit()
+
+    try:
+        labeling_service.suggest_labels(db, file.id, llm=llm)
+    except Exception as exc:
+        # Only resource errors (Ollama connectivity) bubble up from suggest_labels;
+        # non-resource errors are absorbed there and return [].
+        # Mark the job failed and re-raise so RQ can retry.
+        job.status = "failed"
+        job.error_message = str(exc)
+        job.completed_at = datetime.now(timezone.utc)
+        file.status = "failed"
+        db.commit()
+        raise
+
+    job.status = "succeeded"
+    job.completed_at = datetime.now(timezone.utc)
+    file.status = "ready"
     db.commit()
 
     return job

@@ -51,8 +51,10 @@ def test_process_file_creates_chunks_from_text_layer_pdf(db, registered_file):
 
     result = process_file(db, job.id)
 
-    assert result.status == "chunking"
+    # No labels in DB → suggest_labels() returns early; pipeline completes normally.
+    assert result.status == "succeeded"
     assert result.started_at is not None
+    assert result.completed_at is not None
 
     chunks = db.scalars(select(FileChunk).where(FileChunk.file_id == registered_file.id)).all()
     assert len(chunks) >= 1
@@ -61,4 +63,4 @@ def test_process_file_creates_chunks_from_text_layer_pdf(db, registered_file):
         assert chunk.embedding is None
 
     db.refresh(registered_file)
-    assert registered_file.status == "processing"
+    assert registered_file.status == "ready"
