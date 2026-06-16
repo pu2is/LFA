@@ -42,11 +42,11 @@ def process_file(db: Session, job_id: uuid.UUID) -> ProcessingJob:
     db.commit()
 
     try:
-        raw_text = extraction.extract_text(Path(file.full_path), file.file_type)
+        result = extraction.extract_text(Path(file.full_path), file.file_type)
     except Exception as exc:
-        # Any extraction failure (unsupported type, corrupted file, etc.) is
-        # surfaced here so the job and file reflect the real outcome rather
-        # than silently producing empty or garbage labels downstream.
+        # Any extraction failure (unsupported type, corrupted file, no usable
+        # text after OCR, etc.) is surfaced here so the job and file reflect
+        # the real outcome rather than silently producing garbage labels.
         job.status = "failed"
         job.error_message = str(exc)
         job.completed_at = datetime.now(timezone.utc)
@@ -54,9 +54,11 @@ def process_file(db: Session, job_id: uuid.UUID) -> ProcessingJob:
         db.commit()
         return job
 
-    cleaned_text = cleaning.clean(raw_text)
+    cleaned_text = cleaning.clean(result.text)
 
     job.status = "chunking"
+    if result.ocr_applied:
+        file.ocr_applied = True
     db.commit()
 
     rag_service.chunk_and_store(db, file.id, cleaned_text)
