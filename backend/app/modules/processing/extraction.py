@@ -10,13 +10,24 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import pdf2image
-import pytesseract
+import fitz  # pymupdf — bundles MuPDF statically, no external binary needed
+import easyocr
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
 
 # PDFs with fewer characters than this in their text layer are treated as
-# scanned images and routed through the Tesseract OCR fallback.
+# scanned images and routed through the EasyOCR fallback.
 OCR_THRESHOLD = 50
+
+# Lazy singleton: EasyOCR loads ~200 MB of models on first call and caches
+# them to ~/.EasyOCR — reuse the same Reader for every subsequent OCR job.
+_ocr_reader: easyocr.Reader | None = None
+
+
+def _get_ocr_reader() -> easyocr.Reader:
+    global _ocr_reader
+    if _ocr_reader is None:
+        _ocr_reader = easyocr.Reader(["en", "de", "ch_sim"], gpu=False)
+    return _ocr_reader
 
 
 @dataclass
@@ -57,17 +68,23 @@ def _extract_doc(path: Path) -> str:
 
 
 def _extract_pdf_with_ocr(path: Path) -> str:
-    """OCR fallback for scanned PDFs using Tesseract (eng + deu + chi_sim)."""
-    images = pdf2image.convert_from_path(str(path))
-    texts = [pytesseract.image_to_string(img, lang="eng+deu+chi_sim") for img in images]
-    return "\n".join(texts)
+    """OCR fallback for scanned PDFs using EasyOCR + PyMuPDF (no external binaries)."""
+    reader = _get_ocr_reader()
+    doc = fitz.open(str(path))
+    page_texts: list[str] = []
+    for page in doc:
+        img_bytes = page.get_pixmap(dpi=300).tobytes("png")
+        results = reader.readtext(img_bytes)
+        page_texts.append("\n".join(r[1] for r in results))
+    doc.close()
+    return "\n".join(page_texts)
 
 
 def extract_text(path: Path, file_type: str) -> ExtractionResult:
     """Return the full text of a document.
 
     For PDFs whose text layer is below OCR_THRESHOLD characters, falls back to
-    Tesseract OCR and sets ocr_applied=True on the result.
+    EasyOCR and sets ocr_applied=True on the result.
     Raises RuntimeError when no usable text can be extracted after all fallbacks.
     Raises KeyError for unrecognised file_type values.
     """
