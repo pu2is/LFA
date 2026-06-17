@@ -6,7 +6,6 @@ from app.shared.config import settings
 
 redis_connection = Redis.from_url(settings.redis_url)
 
-# check update
 scan_queue = Queue(
     name="scan",
     connection=redis_connection,
