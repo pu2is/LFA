@@ -51,7 +51,7 @@ def test_process_file_creates_chunks_from_text_layer_pdf(db, registered_file):
 
     result = process_file(db, job.id)
 
-    # No labels in DB → suggest_labels() returns early; pipeline completes normally.
+    # No llm injected → uses real ChatOllama; requires Ollama to be running.
     assert result.status == "succeeded"
     assert result.started_at is not None
     assert result.completed_at is not None

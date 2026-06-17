@@ -1,7 +1,8 @@
 """Unit tests for processing/extraction.py.
 
-External binaries (Tesseract, Poppler, LibreOffice) are mocked so these tests
-run without any system-level installation.
+LibreOffice is mocked so these tests run without any system-level installation.
+EasyOCR/PyMuPDF OCR fallback is tested by patching _extract_pdf_with_ocr directly,
+which avoids loading the ~200 MB EasyOCR model in a unit-test context.
 
 Loader mocking note: _LOADERS is populated at import time with references to
 the actual loader classes.  Patching the *name* PyPDFLoader in the module
@@ -70,11 +71,9 @@ class TestOcrFallback:
 
         with (
             patch.dict(extraction._LOADERS, {"pdf": mock_cls}),
-            patch("app.modules.processing.extraction.pdf2image") as mock_pdf2image,
-            patch("app.modules.processing.extraction.pytesseract") as mock_tesseract,
+            patch("app.modules.processing.extraction._extract_pdf_with_ocr") as mock_ocr,
         ):
-            mock_pdf2image.convert_from_path.return_value = [MagicMock()]
-            mock_tesseract.image_to_string.return_value = ocr_text
+            mock_ocr.return_value = ocr_text
             result = extract_text(pdf, "pdf")
 
         assert result.ocr_applied is True
@@ -90,10 +89,10 @@ class TestOcrFallback:
 
         with (
             patch.dict(extraction._LOADERS, {"pdf": mock_cls}),
-            patch("app.modules.processing.extraction.pdf2image") as mock_pdf2image,
+            patch("app.modules.processing.extraction._extract_pdf_with_ocr") as mock_ocr,
         ):
             result = extract_text(pdf, "pdf")
-            mock_pdf2image.convert_from_path.assert_not_called()
+            mock_ocr.assert_not_called()
 
         assert result.ocr_applied is False
 
@@ -108,11 +107,9 @@ class TestFailureHandling:
 
         with (
             patch.dict(extraction._LOADERS, {"pdf": mock_cls}),
-            patch("app.modules.processing.extraction.pdf2image") as mock_pdf2image,
-            patch("app.modules.processing.extraction.pytesseract") as mock_tesseract,
+            patch("app.modules.processing.extraction._extract_pdf_with_ocr") as mock_ocr,
         ):
-            mock_pdf2image.convert_from_path.return_value = [MagicMock()]
-            mock_tesseract.image_to_string.return_value = "   \n  "
+            mock_ocr.return_value = "   \n  "
 
             with pytest.raises(RuntimeError, match="No text could be extracted"):
                 extract_text(pdf, "pdf")
