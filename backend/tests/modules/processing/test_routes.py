@@ -208,3 +208,90 @@ def test_get_files_processing_job_status_is_none_when_no_job(path_and_discovered
     data = resp.json()
     assert len(data) == 1
     assert data[0]["processing_job_status"] is None
+
+
+# ---------------------------------------------------------------------------
+# POST /process/relabel
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def path_and_ready_file(db: Session):
+    """Insert a RegisteredPath + one ready File; clean up after the test."""
+    path = RegisteredPath(path=_FAKE_PATH + "_relabel")
+    db.add(path)
+    db.flush()
+
+    file = File(
+        path_id=path.id,
+        filename="ready_doc.pdf",
+        full_path=f"{_FAKE_PATH}_relabel/ready_doc.pdf",
+        file_type="pdf",
+        file_size=2048,
+        file_hash="cafebabe" * 8,
+        file_modified_at=datetime.now(timezone.utc),
+        status="ready",
+    )
+    db.add(file)
+    db.commit()
+    db.refresh(path)
+    db.refresh(file)
+
+    yield path, file
+
+    db.execute(delete(ProcessingJob).where(ProcessingJob.file_id == file.id))
+    db.delete(file)
+    db.delete(path)
+    db.commit()
+
+
+@patch("app.modules.processing.routes.labeling_queue")
+def test_post_relabel_returns_202_and_queued_job(mock_q, path_and_ready_file):
+    _, file = path_and_ready_file
+    rq_job, rq_id = _mock_rq_job()
+    mock_q.enqueue.return_value = rq_job
+
+    resp = client.post("/process/relabel", json={"file_ids": [str(file.id)]})
+
+    assert resp.status_code == 202
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["file_id"] == str(file.id)
+    assert data[0]["status"] == "queued"
+    assert data[0]["rq_job_id"] == rq_id
+    mock_q.enqueue.assert_called_once()
+
+
+@patch("app.modules.processing.routes.labeling_queue")
+def test_post_relabel_enqueues_run_relabel_job(mock_q, path_and_ready_file):
+    """The enqueued task must be run_relabel_job, not run_processing_job."""
+    from app.modules.processing.tasks import run_relabel_job
+
+    _, file = path_and_ready_file
+    rq_job, _ = _mock_rq_job()
+    mock_q.enqueue.return_value = rq_job
+
+    client.post("/process/relabel", json={"file_ids": [str(file.id)]})
+
+    call_args = mock_q.enqueue.call_args
+    assert call_args[0][0] is run_relabel_job
+
+
+@patch("app.modules.processing.routes.labeling_queue")
+def test_post_relabel_skips_non_ready_files(mock_q, path_and_discovered_file):
+    """Files not in 'ready' status are silently skipped (not enqueued)."""
+    _, file = path_and_discovered_file  # status='discovered'
+    rq_job, _ = _mock_rq_job()
+    mock_q.enqueue.return_value = rq_job
+
+    resp = client.post("/process/relabel", json={"file_ids": [str(file.id)]})
+
+    assert resp.status_code == 202
+    assert resp.json() == []
+    mock_q.enqueue.assert_not_called()
+
+
+@patch("app.modules.processing.routes.labeling_queue")
+def test_post_relabel_unknown_id_returns_404(mock_q, db):
+    resp = client.post("/process/relabel", json={"file_ids": [str(uuid.uuid4())]})
+    assert resp.status_code == 404
+    mock_q.enqueue.assert_not_called()

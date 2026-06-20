@@ -12,8 +12,9 @@ from app.modules.processing.schemas import (
     ProcessByPathIdsRequest,
     ProcessFilesByIdsRequest,
     ProcessingJobRead,
+    RelabelRequest,
 )
-from app.modules.processing.tasks import run_processing_job
+from app.modules.processing.tasks import run_processing_job, run_relabel_job
 from app.shared.database import get_db
 from app.shared.queue import labeling_queue
 
@@ -88,6 +89,41 @@ def process_paths(payload: ProcessByPathIdsRequest, db: Session = Depends(get_db
     for file in files:
         job = service.create_processing_job(db, file.id, triggered_by="manual")
         rq_job = labeling_queue.enqueue(run_processing_job, job.id, retry=_RETRY)
+        job.rq_job_id = str(rq_job.id)
+        db.commit()
+        db.refresh(job)
+        jobs.append(job)
+
+    return jobs
+
+
+@router.post(
+    "/relabel",
+    response_model=list[ProcessingJobRead],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def relabel_files(payload: RelabelRequest, db: Session = Depends(get_db)):
+    """Re-run label suggestion on already-processed files, merging with existing labels.
+
+    Only files with status='ready' are enqueued; others are silently skipped.
+    Returns 404 if any file_id is not found.
+    Existing confirmed labels are preserved; rejected labels are reset to suggested.
+    """
+    files = []
+    for file_id in payload.file_ids:
+        file = db.get(File, file_id)
+        if file is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File {file_id} not found",
+            )
+        if file.status == "ready":
+            files.append(file)
+
+    jobs = []
+    for file in files:
+        job = service.create_processing_job(db, file.id, triggered_by="manual")
+        rq_job = labeling_queue.enqueue(run_relabel_job, job.id, retry=_RETRY)
         job.rq_job_id = str(rq_job.id)
         db.commit()
         db.refresh(job)

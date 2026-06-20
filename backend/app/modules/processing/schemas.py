@@ -8,6 +8,10 @@ class ProcessFilesByIdsRequest(BaseModel):
     file_ids: list[uuid.UUID]
 
 
+class RelabelRequest(BaseModel):
+    file_ids: list[uuid.UUID]
+
+
 class ProcessByPathIdsRequest(BaseModel):
     path_ids: list[uuid.UUID]
 

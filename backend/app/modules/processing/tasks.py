@@ -6,6 +6,19 @@ from app.shared.database import SessionLocal
 from app.shared.queue import embedding_queue
 
 
+def run_relabel_job(job_id: uuid.UUID) -> None:
+    """RQ entrypoint for a re-labeling job (WF1c).
+
+    Only runs the labeling stage; existing chunks are reused.
+    No embedding job is enqueued because chunks have not changed.
+    """
+    db = SessionLocal()
+    try:
+        service.relabel_file(db, job_id)
+    finally:
+        db.close()
+
+
 def run_processing_job(job_id: uuid.UUID) -> None:
     """RQ entrypoint for a processing job (Job1).
 

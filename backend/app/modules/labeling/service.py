@@ -131,6 +131,103 @@ def _ensure_label_catalog(db: Session) -> list[Label]:
     return new_labels
 
 
+def _merge_candidates(
+    db: Session,
+    file_id: uuid.UUID,
+    output: LabelSuggestionOutput,
+    labels: list[Label],
+) -> list[FileLabel]:
+    """Write LLM candidates to file_labels using MERGE semantics (WF1 & WF1c).
+
+    Rules (per docs/workflows.md WF1c):
+      - confirmed → untouched
+      - rejected  → reset to suggested, confidence updated
+      - suggested → confidence updated
+      - new       → insert as suggested
+      - old label absent from new candidates → kept (never deleted)
+
+    On a first-time label run (no existing rows), merge == pure insert.
+    """
+    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
+    # Catalog rows keyed by label_id (the partial-unique index key).
+    by_label_id: dict[uuid.UUID, FileLabel] = {
+        fl.label_id: fl for fl in existing if fl.label_id is not None
+    }
+    # Free-text rows (label_id IS NULL) keyed by normalised label_name.
+    by_free_name: dict[str, FileLabel] = {
+        fl.label_name.lower(): fl for fl in existing if fl.label_id is None
+    }
+
+    label_by_name = {lbl.name.lower(): lbl for lbl in labels}
+    file_labels: list[FileLabel] = []
+    seen_label_ids: set[uuid.UUID] = set()
+
+    # --- Path A: catalog picks ---
+    for candidate in output.catalog_picks:
+        if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
+            continue
+        lbl = label_by_name.get(candidate.name.lower())
+        if lbl is None:
+            logger.debug("_merge_candidates: catalog pick %r not in label catalog — skipping", candidate.name)
+            continue
+        if lbl.id in seen_label_ids:
+            continue
+        seen_label_ids.add(lbl.id)
+
+        existing_fl = by_label_id.get(lbl.id)
+        if existing_fl is not None:
+            if existing_fl.status != "confirmed":
+                existing_fl.status = "suggested"
+                existing_fl.confidence = candidate.confidence
+                file_labels.append(existing_fl)
+        else:
+            fl = FileLabel(
+                file_id=file_id,
+                label_id=lbl.id,
+                label_name=lbl.name,
+                source="llm",
+                status="suggested",
+                confidence=candidate.confidence,
+            )
+            db.add(fl)
+            file_labels.append(fl)
+
+    # --- Path B: free-text suggestions ---
+    seen_free_names: set[str] = set()
+    for candidate in output.free_suggestions:
+        if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
+            continue
+        normalized = candidate.name.strip().lower().replace(" ", "_")
+        if not normalized:
+            continue
+        if normalized in label_by_name:
+            continue
+        if normalized in seen_free_names:
+            continue
+        seen_free_names.add(normalized)
+
+        existing_fl = by_free_name.get(normalized)
+        if existing_fl is not None:
+            if existing_fl.status != "confirmed":
+                existing_fl.status = "suggested"
+                existing_fl.confidence = candidate.confidence
+                file_labels.append(existing_fl)
+        else:
+            fl = FileLabel(
+                file_id=file_id,
+                label_id=None,
+                label_name=normalized,
+                source="llm",
+                status="suggested",
+                confidence=candidate.confidence,
+            )
+            db.add(fl)
+            file_labels.append(fl)
+
+    db.flush()
+    return file_labels
+
+
 def suggest_labels(
     db: Session,
     file_id: uuid.UUID,
@@ -191,56 +288,7 @@ def suggest_labels(
         logger.warning("suggest_labels: non-fatal LLM error for file %s: %s", file_id, exc)
         return []
 
-    file_labels: list[FileLabel] = []
-
-    # --- Path A: catalog picks ---
-    label_by_name = {lbl.name.lower(): lbl for lbl in labels}
-    seen_label_ids: set[uuid.UUID] = set()
-    for candidate in output.catalog_picks:
-        if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
-            continue
-        lbl = label_by_name.get(candidate.name.lower())
-        if lbl is None:
-            logger.debug("suggest_labels: catalog pick %r not found in labels — skipping", candidate.name)
-            continue
-        if lbl.id in seen_label_ids:
-            continue
-        seen_label_ids.add(lbl.id)
-        fl = FileLabel(
-            file_id=file_id,
-            label_id=lbl.id,
-            label_name=lbl.name,
-            source="llm",
-            status="suggested",
-            confidence=candidate.confidence,
-        )
-        db.add(fl)
-        file_labels.append(fl)
-
-    # --- Path B: free-text suggestions ---
-    seen_free_names: set[str] = set()
-    for candidate in output.free_suggestions:
-        if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
-            continue
-        normalized = candidate.name.strip().lower().replace(" ", "_")
-        if not normalized:
-            continue
-        # Skip if LLM essentially re-suggested a catalog label by another name.
-        if normalized in label_by_name:
-            continue
-        if normalized in seen_free_names:
-            continue
-        seen_free_names.add(normalized)
-        fl = FileLabel(
-            file_id=file_id,
-            label_id=None,
-            label_name=normalized,
-            source="llm",
-            status="suggested",
-            confidence=candidate.confidence,
-        )
-        db.add(fl)
-        file_labels.append(fl)
+    file_labels = _merge_candidates(db, file_id, output, labels)
 
     logger.info(
         "suggest_labels: file %s → %d catalog picks, %d free-text suggestions",
@@ -249,7 +297,6 @@ def suggest_labels(
         len([f for f in file_labels if f.label_id is None]),
     )
 
-    db.flush()
     return file_labels
 
 
