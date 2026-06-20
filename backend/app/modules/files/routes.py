@@ -40,6 +40,9 @@ def list_files(path_id: uuid.UUID | None = None, db: Session = Depends(get_db)) 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
     rows = service.list_files(db, path_id)
     return [
-        FileRead.model_validate(file).model_copy(update={"processing_job_status": job_status})
-        for file, job_status in rows
+        FileRead.model_validate(file).model_copy(update={
+            "processing_job_status": job_status,
+            "processing_error_message": error_msg,
+        })
+        for file, job_status, error_msg in rows
     ]

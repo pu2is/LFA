@@ -37,9 +37,7 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
     return db.scalar(select(File).where(File.full_path == full_path))
 
 
-def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File, str | None]]:
-    # Correlated scalar subquery: for each file row, grab the most recent job status.
-    # LEFT JOIN semantics: files with no jobs get NULL (→ None in Python).
+def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File, str | None, str | None]]:
     latest_job_status = (
         select(ProcessingJob.status)
         .where(ProcessingJob.file_id == File.id)
@@ -48,10 +46,26 @@ def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File
         .correlate(File)
         .scalar_subquery()
     )
-    stmt = select(File, latest_job_status.label("processing_job_status"))
+    latest_job_error = (
+        select(ProcessingJob.error_message)
+        .where(ProcessingJob.file_id == File.id)
+        .order_by(ProcessingJob.created_at.desc())
+        .limit(1)
+        .correlate(File)
+        .scalar_subquery()
+    )
+    stmt = select(
+        File,
+        latest_job_status.label("processing_job_status"),
+        latest_job_error.label("processing_error_message"),
+    )
     if path_id is not None:
         stmt = stmt.where(File.path_id == path_id)
     return list(db.execute(stmt))
+
+
+def count_files_by_path(db: Session, path_id: uuid.UUID) -> int:
+    return db.query(File).filter_by(path_id=path_id).count()
 
 
 def upsert_file(

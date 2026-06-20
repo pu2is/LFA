@@ -18,16 +18,26 @@ from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader
 # scanned images and routed through the EasyOCR fallback.
 OCR_THRESHOLD = 50
 
-# Lazy singleton: EasyOCR loads ~200 MB of models on first call and caches
-# them to ~/.EasyOCR — reuse the same Reader for every subsequent OCR job.
-_ocr_reader: easyocr.Reader | None = None
+# EasyOCR's ch_sim model is only compatible with en — cannot combine with de.
+# Two Readers: Latin (en+de) primary, Chinese (ch_sim+en) fallback.
+_latin_reader: easyocr.Reader | None = None
+_chinese_reader: easyocr.Reader | None = None
+
+CHINESE_FALLBACK_THRESHOLD = 10
 
 
-def _get_ocr_reader() -> easyocr.Reader:
-    global _ocr_reader
-    if _ocr_reader is None:
-        _ocr_reader = easyocr.Reader(["en", "de", "ch_sim"], gpu=False)
-    return _ocr_reader
+def _get_latin_reader() -> easyocr.Reader:
+    global _latin_reader
+    if _latin_reader is None:
+        _latin_reader = easyocr.Reader(["en", "de"], gpu=False)
+    return _latin_reader
+
+
+def _get_chinese_reader() -> easyocr.Reader:
+    global _chinese_reader
+    if _chinese_reader is None:
+        _chinese_reader = easyocr.Reader(["ch_sim", "en"], gpu=False)
+    return _chinese_reader
 
 
 @dataclass
@@ -67,17 +77,32 @@ def _extract_doc(path: Path) -> str:
         return "\n".join(p.page_content for p in pages)
 
 
-def _extract_pdf_with_ocr(path: Path) -> str:
-    """OCR fallback for scanned PDFs using EasyOCR + PyMuPDF (no external binaries)."""
-    reader = _get_ocr_reader()
-    doc = fitz.open(str(path))
+def _ocr_pages(reader: easyocr.Reader, doc) -> str:
     page_texts: list[str] = []
     for page in doc:
         img_bytes = page.get_pixmap(dpi=300).tobytes("png")
         results = reader.readtext(img_bytes)
         page_texts.append("\n".join(r[1] for r in results))
-    doc.close()
     return "\n".join(page_texts)
+
+
+def _extract_pdf_with_ocr(path: Path) -> str:
+    """OCR fallback for scanned PDFs using EasyOCR + PyMuPDF (no external binaries).
+
+    Tries Latin (en+de) first; if result is too short, also tries Chinese
+    (ch_sim+en) and keeps whichever produced more text.
+    """
+    doc = fitz.open(str(path))
+    latin_text = _ocr_pages(_get_latin_reader(), doc)
+
+    if len(latin_text.strip()) >= CHINESE_FALLBACK_THRESHOLD:
+        doc.close()
+        return latin_text
+
+    chinese_text = _ocr_pages(_get_chinese_reader(), doc)
+    doc.close()
+
+    return chinese_text if len(chinese_text.strip()) > len(latin_text.strip()) else latin_text
 
 
 def extract_text(path: Path, file_type: str) -> ExtractionResult:
