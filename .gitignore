@@ -29,6 +29,9 @@ uploads/
 # local project notes
 docs/
 
+# dev frontend (test-only, not shipped)
+dev_frontend/
+
 # claude files
 CLAUDE.md
 .claude
