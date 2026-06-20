@@ -7,6 +7,20 @@ from sqlalchemy.orm import Session
 from app.modules.files import service as files_service
 from app.modules.scans import discovery
 from app.modules.scans.models import Scan
+from app.shared.events import publish_event
+
+
+def _publish_scan_status(scan: Scan, file_count: int | None = None) -> None:
+    data: dict = {
+        "scan_id": str(scan.id),
+        "path_id": str(scan.path_id),
+        "status": scan.status,
+    }
+    if scan.error_message:
+        data["error_message"] = scan.error_message
+    if file_count is not None:
+        data["file_count"] = file_count
+    publish_event("scan_status", data)
 
 
 def create_scan(db: Session, path_id: uuid.UUID) -> Scan:
@@ -39,6 +53,7 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> Scan:
     scan.status = "running"
     scan.started_at = datetime.now(timezone.utc)
     db.commit()
+    _publish_scan_status(scan)
 
     try:
         for doc in discovery.iter_documents(Path(registered_path.path)):
@@ -61,10 +76,13 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> Scan:
         scan.error_message = str(exc)
         scan.completed_at = datetime.now(timezone.utc)
         db.commit()
+        _publish_scan_status(scan)
         return scan
 
+    file_count = files_service.count_files_by_path(db, scan.path_id)
     scan.status = "completed"
     scan.completed_at = datetime.now(timezone.utc)
     registered_path.last_scanned_at = scan.completed_at
     db.commit()
+    _publish_scan_status(scan, file_count=file_count)
     return scan
