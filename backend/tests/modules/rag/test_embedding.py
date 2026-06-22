@@ -5,7 +5,7 @@ All tests use FakeEmbeddings — Ollama is never called.
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.rag.models import EMBEDDING_DIMENSIONS, FileChunk
@@ -61,11 +61,6 @@ def file_with_chunks(db):
     db.refresh(f)
 
     yield f, chunks
-
-    db.execute(delete(FileChunk).where(FileChunk.file_id == f.id))
-    db.delete(f)
-    db.delete(path)
-    db.commit()
 
 
 # --------------------------------------------------------------------------- #

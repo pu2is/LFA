@@ -2,7 +2,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.scans.models import Scan
@@ -20,15 +20,7 @@ def registered_path(db):
     path = RegisteredPath(path=str(TEST_DIR.resolve()))
     db.add(path)
     db.commit()
-
     yield path
-
-    # Scans run inside the test wrote File/Scan rows tied to this path;
-    # clear them so the unique "paths.path" constraint stays free for the next run.
-    db.execute(delete(File).where(File.path_id == path.id))
-    db.execute(delete(Scan).where(Scan.path_id == path.id))
-    db.delete(path)
-    db.commit()
 
 
 def _queue_scan(db, path_id: uuid.UUID) -> Scan:

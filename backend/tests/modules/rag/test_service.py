@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.rag.models import FileChunk
@@ -30,11 +30,6 @@ def test_file(db):
     db.commit()
     db.refresh(file)
     yield file
-
-    db.execute(delete(FileChunk).where(FileChunk.file_id == file.id))
-    db.delete(file)
-    db.delete(path)
-    db.commit()
 
 
 def test_chunk_and_store_creates_chunks(db, test_file):

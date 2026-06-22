@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.processing.models import ProcessingJob
@@ -38,12 +38,6 @@ def registered_file(db):
     db.commit()
     db.refresh(file)
     yield file
-
-    db.execute(delete(FileChunk).where(FileChunk.file_id == file.id))
-    db.execute(delete(ProcessingJob).where(ProcessingJob.file_id == file.id))
-    db.delete(file)
-    db.delete(path)
-    db.commit()
 
 
 def test_process_file_creates_chunks_from_text_layer_pdf(db, registered_file):
