@@ -1,5 +1,6 @@
 import logging
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from langchain_core.language_models import BaseChatModel
@@ -13,6 +14,7 @@ from app.modules.labeling.models import FileLabel, Label
 from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS
 from app.modules.rag.models import FileChunk
 from app.shared.config import settings
+from app.shared.events import publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -135,80 +137,43 @@ def _ensure_label_catalog(db: Session) -> list[Label]:
     return new_labels
 
 
-def _merge_candidates(
+def _write_initial_candidates(
     db: Session,
     file_id: uuid.UUID,
     output: LabelSuggestionOutput,
     labels: list[Label],
 ) -> list[FileLabel]:
-    """Write LLM candidates to file_labels using MERGE semantics (WF1 & WF1c).
+    """Write LLM candidates to file_labels for first-time labeling (mode=initial).
 
-    Rules (per docs/workflows.md WF1c):
-      - confirmed → untouched
-      - rejected  → reset to suggested, confidence updated
-      - suggested → confidence updated
-      - new       → insert as suggested
-      - old label absent from new candidates → kept (never deleted)
-
-    On a first-time label run (no existing rows), merge == pure insert.
+    Pure INSERT — initial mode targets files with no existing file_labels.
     """
-    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
-    # Catalog rows keyed by label_id (the partial-unique index key).
-    by_label_id: dict[uuid.UUID, FileLabel] = {
-        fl.label_id: fl for fl in existing if fl.label_id is not None
-    }
-    # Free-text rows (label_id IS NULL) keyed by normalised label_name.
-    by_free_name: dict[str, FileLabel] = {
-        normalize_label_name(fl.label_name): fl for fl in existing if fl.label_id is None
-    }
-
     label_by_name = {normalize_label_name(lbl.name): lbl for lbl in labels}
     file_labels: list[FileLabel] = []
     seen_label_ids: set[uuid.UUID] = set()
 
-    # --- Path A: catalog picks ---
     for candidate in output.catalog_picks:
         if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
             continue
         norm = normalize_label_name(candidate.name)
         lbl = label_by_name.get(norm)
         if lbl is None:
-            logger.debug("_merge_candidates: catalog pick %r not in label catalog — skipping", candidate.name)
+            logger.debug("_write_initial: catalog pick %r not in label catalog — skipping", candidate.name)
             continue
         if lbl.id in seen_label_ids:
             continue
         seen_label_ids.add(lbl.id)
 
-        existing_fl = by_label_id.get(lbl.id)
-        if existing_fl is not None:
-            if existing_fl.status != "confirmed":
-                existing_fl.status = "suggested"
-                existing_fl.confidence = candidate.confidence
-                file_labels.append(existing_fl)
-        else:
-            # Promote: if a free-text row with the same name already exists,
-            # upgrade it to a catalog row instead of inserting a duplicate.
-            free_fl = by_free_name.pop(norm, None)
-            if free_fl is not None:
-                free_fl.label_id = lbl.id
-                free_fl.label_name = lbl.name
-                if free_fl.status != "confirmed":
-                    free_fl.status = "suggested"
-                    free_fl.confidence = candidate.confidence
-                file_labels.append(free_fl)
-            else:
-                fl = FileLabel(
-                    file_id=file_id,
-                    label_id=lbl.id,
-                    label_name=lbl.name,
-                    source="llm",
-                    status="suggested",
-                    confidence=candidate.confidence,
-                )
-                db.add(fl)
-                file_labels.append(fl)
+        fl = FileLabel(
+            file_id=file_id,
+            label_id=lbl.id,
+            label_name=lbl.name,
+            source="llm",
+            status="suggested",
+            confidence=candidate.confidence,
+        )
+        db.add(fl)
+        file_labels.append(fl)
 
-    # --- Path B: free-text suggestions ---
     seen_free_names: set[str] = set()
     for candidate in output.free_suggestions:
         if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
@@ -222,23 +187,16 @@ def _merge_candidates(
             continue
         seen_free_names.add(normalized)
 
-        existing_fl = by_free_name.get(normalized)
-        if existing_fl is not None:
-            if existing_fl.status != "confirmed":
-                existing_fl.status = "suggested"
-                existing_fl.confidence = candidate.confidence
-                file_labels.append(existing_fl)
-        else:
-            fl = FileLabel(
-                file_id=file_id,
-                label_id=None,
-                label_name=normalized,
-                source="llm",
-                status="suggested",
-                confidence=candidate.confidence,
-            )
-            db.add(fl)
-            file_labels.append(fl)
+        fl = FileLabel(
+            file_id=file_id,
+            label_id=None,
+            label_name=normalized,
+            source="llm",
+            status="suggested",
+            confidence=candidate.confidence,
+        )
+        db.add(fl)
+        file_labels.append(fl)
 
     db.flush()
     return file_labels
@@ -304,7 +262,7 @@ def suggest_labels(
         logger.warning("suggest_labels: non-fatal LLM error for file %s: %s", file_id, exc)
         return []
 
-    file_labels = _merge_candidates(db, file_id, output, labels)
+    file_labels = _write_initial_candidates(db, file_id, output, labels)
 
     logger.info(
         "suggest_labels: file %s → %d catalog picks, %d free-text suggestions",
@@ -314,6 +272,68 @@ def suggest_labels(
     )
 
     return file_labels
+
+
+
+# --------------------------------------------------------------------------- #
+# Label job runner (unified jobs table)
+# --------------------------------------------------------------------------- #
+
+def _publish_label_event(job) -> None:
+    data: dict = {
+        "job_id": str(job.id),
+        "type": job.type,
+        "file_id": str(job.file_id),
+        "status": job.status,
+        "mode": job.mode,
+    }
+    if job.error_message:
+        data["error_message"] = job.error_message
+    publish_event("job_status", data)
+
+
+def run_label(
+    db: Session,
+    job_id: uuid.UUID,
+    *,
+    llm: BaseChatModel | None = None,
+):
+    """Execute a label job: dispatch to initial or augment based on job.mode."""
+    from app.modules.files.models import File
+    from app.modules.jobs.models import Job
+
+    job = db.get(Job, job_id)
+    if job is None:
+        raise ValueError(f"Job {job_id} not found")
+
+    file = db.get(File, job.file_id)
+    if file is None:
+        raise ValueError(f"File {job.file_id} not found")
+
+    job.status = "running"
+    job.stage = "labeling"
+    job.started_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_label_event(job)
+
+    try:
+        suggest_labels(db, file.id, llm=llm)
+    except Exception as exc:
+        job.status = "failed"
+        job.error_message = str(exc)
+        job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        _publish_label_event(job)
+        raise
+
+    job.status = "succeeded"
+    job.stage = None
+    job.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_label_event(job)
+
+    return job
+
 
 
 # --------------------------------------------------------------------------- #
