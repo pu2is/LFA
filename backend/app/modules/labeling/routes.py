@@ -1,9 +1,13 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from rq.job import Retry
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.modules.files import service as files_service
 from app.modules.files.models import File
+from app.modules.jobs.models import Job
 from app.modules.labeling import service
 from app.modules.labeling.presets import get_preset_catalog
 from app.modules.labeling.schemas import (
@@ -12,10 +16,19 @@ from app.modules.labeling.schemas import (
     FileLabelRead,
     LabelBulkCreate,
     LabelBulkCreateResult,
+    LabelByFileIdsRequest,
+    LabelByPathIdsRequest,
+    LabelJobEnqueued,
+    LabelJobResult,
+    LabelJobSkipped,
     LabelRead,
     PresetRead,
 )
+from app.modules.labeling.tasks import run_label_job
 from app.shared.database import get_db
+from app.shared.queue import labeling_queue
+
+_RETRY = Retry(max=3, interval=[60, 120, 300])
 
 
 def _require_file(db: Session, file_id: uuid.UUID) -> None:
@@ -30,6 +43,74 @@ router = APIRouter(tags=["labels"])
 @router.get("/labels/presets", response_model=list[PresetRead])
 def list_presets() -> list[dict[str, str | bool]]:
     return get_preset_catalog()
+
+
+def _enqueue_label_jobs(
+    db: Session,
+    files: list[File],
+) -> LabelJobResult:
+    """Create label jobs for eligible files and enqueue them."""
+    enqueued: list[LabelJobEnqueued] = []
+    skipped: list[LabelJobSkipped] = []
+
+    for file in files:
+        if file.status != "ready":
+            skipped.append(LabelJobSkipped(file_id=file.id, reason=f"status is '{file.status}', not 'ready'"))
+            continue
+
+        has_labels = service.file_has_labels(db, file.id)
+        mode = "augment" if has_labels else "initial"
+
+        job = Job(type="label", file_id=file.id, trigger="manual", mode=mode)
+        db.add(job)
+        db.flush()
+
+        rq_job = labeling_queue.enqueue(run_label_job, job.id, retry=_RETRY)
+        job.rq_job_id = str(rq_job.id)
+        db.commit()
+
+        enqueued.append(LabelJobEnqueued(job_id=job.id, file_id=file.id, mode=mode))
+
+    return LabelJobResult(enqueued=enqueued, skipped=skipped)
+
+
+@router.post("/label/files", response_model=LabelJobResult, status_code=status.HTTP_202_ACCEPTED)
+def label_files(payload: LabelByFileIdsRequest, db: Session = Depends(get_db)):
+    """Enqueue label jobs for the given file IDs.
+
+    Files in 'ready' status without existing labels get mode=initial;
+    files with existing labels get mode=augment.
+    Non-ready files are skipped. Unknown IDs return 404.
+    """
+    files: list[File] = []
+    for file_id in payload.file_ids:
+        file = db.get(File, file_id)
+        if file is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"File {file_id} not found",
+            )
+        files.append(file)
+
+    return _enqueue_label_jobs(db, files)
+
+
+@router.post("/label/paths", response_model=LabelJobResult, status_code=status.HTTP_202_ACCEPTED)
+def label_paths(payload: LabelByPathIdsRequest, db: Session = Depends(get_db)):
+    """Enqueue label jobs for all ready files under the given path IDs."""
+    for path_id in payload.path_ids:
+        if files_service.get_path(db, path_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Path {path_id} not found",
+            )
+
+    files = list(
+        db.scalars(
+            select(File).where(File.path_id.in_(payload.path_ids))
+        )
+    )
+    return _enqueue_label_jobs(db, files)
 
 
 @router.get("/labels", response_model=list[LabelRead])

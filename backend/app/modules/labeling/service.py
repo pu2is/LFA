@@ -1,5 +1,6 @@
 import logging
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 from langchain_core.language_models import BaseChatModel
@@ -13,6 +14,7 @@ from app.modules.labeling.models import FileLabel, Label
 from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS
 from app.modules.rag.models import FileChunk
 from app.shared.config import settings
+from app.shared.events import publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -135,80 +137,43 @@ def _ensure_label_catalog(db: Session) -> list[Label]:
     return new_labels
 
 
-def _merge_candidates(
+def _write_initial_candidates(
     db: Session,
     file_id: uuid.UUID,
     output: LabelSuggestionOutput,
     labels: list[Label],
 ) -> list[FileLabel]:
-    """Write LLM candidates to file_labels using MERGE semantics (WF1 & WF1c).
+    """Write LLM candidates to file_labels for first-time labeling (mode=initial).
 
-    Rules (per docs/workflows.md WF1c):
-      - confirmed → untouched
-      - rejected  → reset to suggested, confidence updated
-      - suggested → confidence updated
-      - new       → insert as suggested
-      - old label absent from new candidates → kept (never deleted)
-
-    On a first-time label run (no existing rows), merge == pure insert.
+    Pure INSERT — initial mode targets files with no existing file_labels.
     """
-    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
-    # Catalog rows keyed by label_id (the partial-unique index key).
-    by_label_id: dict[uuid.UUID, FileLabel] = {
-        fl.label_id: fl for fl in existing if fl.label_id is not None
-    }
-    # Free-text rows (label_id IS NULL) keyed by normalised label_name.
-    by_free_name: dict[str, FileLabel] = {
-        normalize_label_name(fl.label_name): fl for fl in existing if fl.label_id is None
-    }
-
     label_by_name = {normalize_label_name(lbl.name): lbl for lbl in labels}
     file_labels: list[FileLabel] = []
     seen_label_ids: set[uuid.UUID] = set()
 
-    # --- Path A: catalog picks ---
     for candidate in output.catalog_picks:
         if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
             continue
         norm = normalize_label_name(candidate.name)
         lbl = label_by_name.get(norm)
         if lbl is None:
-            logger.debug("_merge_candidates: catalog pick %r not in label catalog — skipping", candidate.name)
+            logger.debug("_write_initial: catalog pick %r not in label catalog — skipping", candidate.name)
             continue
         if lbl.id in seen_label_ids:
             continue
         seen_label_ids.add(lbl.id)
 
-        existing_fl = by_label_id.get(lbl.id)
-        if existing_fl is not None:
-            if existing_fl.status != "confirmed":
-                existing_fl.status = "suggested"
-                existing_fl.confidence = candidate.confidence
-                file_labels.append(existing_fl)
-        else:
-            # Promote: if a free-text row with the same name already exists,
-            # upgrade it to a catalog row instead of inserting a duplicate.
-            free_fl = by_free_name.pop(norm, None)
-            if free_fl is not None:
-                free_fl.label_id = lbl.id
-                free_fl.label_name = lbl.name
-                if free_fl.status != "confirmed":
-                    free_fl.status = "suggested"
-                    free_fl.confidence = candidate.confidence
-                file_labels.append(free_fl)
-            else:
-                fl = FileLabel(
-                    file_id=file_id,
-                    label_id=lbl.id,
-                    label_name=lbl.name,
-                    source="llm",
-                    status="suggested",
-                    confidence=candidate.confidence,
-                )
-                db.add(fl)
-                file_labels.append(fl)
+        fl = FileLabel(
+            file_id=file_id,
+            label_id=lbl.id,
+            label_name=lbl.name,
+            source="llm",
+            status="suggested",
+            confidence=candidate.confidence,
+        )
+        db.add(fl)
+        file_labels.append(fl)
 
-    # --- Path B: free-text suggestions ---
     seen_free_names: set[str] = set()
     for candidate in output.free_suggestions:
         if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
@@ -222,23 +187,16 @@ def _merge_candidates(
             continue
         seen_free_names.add(normalized)
 
-        existing_fl = by_free_name.get(normalized)
-        if existing_fl is not None:
-            if existing_fl.status != "confirmed":
-                existing_fl.status = "suggested"
-                existing_fl.confidence = candidate.confidence
-                file_labels.append(existing_fl)
-        else:
-            fl = FileLabel(
-                file_id=file_id,
-                label_id=None,
-                label_name=normalized,
-                source="llm",
-                status="suggested",
-                confidence=candidate.confidence,
-            )
-            db.add(fl)
-            file_labels.append(fl)
+        fl = FileLabel(
+            file_id=file_id,
+            label_id=None,
+            label_name=normalized,
+            source="llm",
+            status="suggested",
+            confidence=candidate.confidence,
+        )
+        db.add(fl)
+        file_labels.append(fl)
 
     db.flush()
     return file_labels
@@ -304,7 +262,7 @@ def suggest_labels(
         logger.warning("suggest_labels: non-fatal LLM error for file %s: %s", file_id, exc)
         return []
 
-    file_labels = _merge_candidates(db, file_id, output, labels)
+    file_labels = _write_initial_candidates(db, file_id, output, labels)
 
     logger.info(
         "suggest_labels: file %s → %d catalog picks, %d free-text suggestions",
@@ -314,6 +272,223 @@ def suggest_labels(
     )
 
     return file_labels
+
+
+
+# --------------------------------------------------------------------------- #
+# Augment labeling (mode=augment, #26)
+# --------------------------------------------------------------------------- #
+
+class AugmentCandidate(BaseModel):
+    name: str = Field(description="A new label name; use lowercase_with_underscores")
+
+
+class AugmentSuggestionOutput(BaseModel):
+    new_labels: list[AugmentCandidate] = Field(
+        default_factory=list,
+        description="New labels that describe this document from a different angle",
+    )
+
+
+_AUGMENT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a document classification assistant. "
+            "The user already has labels on this document and wants MORE labels "
+            "from DIFFERENT angles or finer granularity.\n\n"
+            "Rules:\n"
+            "- DO NOT repeat any label from the existing list below.\n"
+            "- DO NOT suggest synonyms or near-synonyms of rejected labels.\n"
+            "- Use the confirmed labels as positive style references "
+            "(the user likes this level of specificity).\n"
+            "- Invent specific, fine-grained labels in lowercase_with_underscores.\n"
+            "- Only suggest labels you are confident about. "
+            "If nothing fits, return an empty list.\n"
+            "- You may pick from the catalog OR invent new names.",
+        ),
+        (
+            "human",
+            "Confirmed labels (user likes these): {confirmed}\n"
+            "Rejected labels (avoid these and synonyms): {rejected}\n"
+            "All existing label names (do NOT repeat): {all_existing}\n\n"
+            "Available catalog labels: {catalog}\n\n"
+            "Document excerpt:\n{text}\n\n"
+            "Return new_labels only — labels NOT in the existing list above.",
+        ),
+    ]
+)
+
+
+def _append_augment_candidates(
+    db: Session,
+    file_id: uuid.UUID,
+    output: AugmentSuggestionOutput,
+    labels: list[Label],
+) -> list[FileLabel]:
+    """Append-only write for augment mode: INSERT new names, never touch existing rows."""
+    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
+    existing_names: set[str] = {normalize_label_name(fl.label_name) for fl in existing}
+
+    label_by_name = {normalize_label_name(lbl.name): lbl for lbl in labels}
+    file_labels: list[FileLabel] = []
+    seen_names: set[str] = set()
+
+    for candidate in output.new_labels:
+        normalized = normalize_label_name(candidate.name)
+        if not normalized:
+            continue
+        if normalized in existing_names:
+            continue
+        if normalized in seen_names:
+            continue
+        seen_names.add(normalized)
+
+        lbl = label_by_name.get(normalized)
+        fl = FileLabel(
+            file_id=file_id,
+            label_id=lbl.id if lbl else None,
+            label_name=lbl.name if lbl else normalized,
+            source="llm",
+            status="suggested",
+            confidence=None,
+        )
+        db.add(fl)
+        file_labels.append(fl)
+
+    db.flush()
+    return file_labels
+
+
+def suggest_labels_augment(
+    db: Session,
+    file_id: uuid.UUID,
+    *,
+    llm: BaseChatModel | None = None,
+    max_chunks: int | None = None,
+) -> list[FileLabel]:
+    """Augment prompt: suggest NEW labels for a file that already has labels."""
+    labels = _ensure_label_catalog(db)
+
+    all_chunks = list(
+        db.scalars(
+            select(FileChunk)
+            .where(FileChunk.file_id == file_id)
+            .order_by(FileChunk.chunk_index)
+        )
+    )
+    if not all_chunks:
+        logger.warning("suggest_labels_augment: no chunks for file %s", file_id)
+        return []
+
+    chunks = all_chunks if max_chunks is None else all_chunks[:max_chunks]
+
+    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
+    confirmed = [fl.label_name for fl in existing if fl.status == "confirmed"]
+    rejected = [fl.label_name for fl in existing if fl.status == "rejected"]
+    all_existing = [fl.label_name for fl in existing]
+
+    if llm is None:
+        llm = ChatOllama(
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            temperature=0,
+        )
+
+    structured_llm = llm.with_structured_output(AugmentSuggestionOutput)
+    messages = _AUGMENT_PROMPT.format_messages(
+        confirmed=", ".join(confirmed) or "(none)",
+        rejected=", ".join(rejected) or "(none)",
+        all_existing=", ".join(all_existing) or "(none)",
+        catalog=", ".join(lbl.name for lbl in labels),
+        text="\n\n".join(c.content for c in chunks),
+    )
+
+    try:
+        output: AugmentSuggestionOutput = structured_llm.invoke(messages)
+    except (httpx.ConnectError, httpx.TimeoutException):
+        raise
+    except Exception as exc:
+        logger.warning("suggest_labels_augment: non-fatal LLM error for file %s: %s", file_id, exc)
+        return []
+
+    file_labels = _append_augment_candidates(db, file_id, output, labels)
+
+    logger.info(
+        "suggest_labels_augment: file %s → %d new labels appended",
+        file_id,
+        len(file_labels),
+    )
+    return file_labels
+
+
+# --------------------------------------------------------------------------- #
+# Label job runner (unified jobs table)
+# --------------------------------------------------------------------------- #
+
+def _publish_label_event(job) -> None:
+    data: dict = {
+        "job_id": str(job.id),
+        "type": job.type,
+        "file_id": str(job.file_id),
+        "status": job.status,
+        "mode": job.mode,
+    }
+    if job.error_message:
+        data["error_message"] = job.error_message
+    publish_event("job_status", data)
+
+
+def run_label(
+    db: Session,
+    job_id: uuid.UUID,
+    *,
+    llm: BaseChatModel | None = None,
+):
+    """Execute a label job: dispatch to initial or augment based on job.mode."""
+    from app.modules.files.models import File
+    from app.modules.jobs.models import Job
+
+    job = db.get(Job, job_id)
+    if job is None:
+        raise ValueError(f"Job {job_id} not found")
+
+    file = db.get(File, job.file_id)
+    if file is None:
+        raise ValueError(f"File {job.file_id} not found")
+
+    job.status = "running"
+    job.stage = "labeling"
+    job.started_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_label_event(job)
+
+    try:
+        if job.mode == "augment":
+            suggest_labels_augment(db, file.id, llm=llm)
+        else:
+            suggest_labels(db, file.id, llm=llm)
+    except Exception as exc:
+        job.status = "failed"
+        job.error_message = str(exc)
+        job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        _publish_label_event(job)
+        raise
+
+    job.status = "succeeded"
+    job.stage = None
+    job.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_label_event(job)
+
+    return job
+
+
+def file_has_labels(db: Session, file_id: uuid.UUID) -> bool:
+    return db.scalar(
+        select(FileLabel.id).where(FileLabel.file_id == file_id).limit(1)
+    ) is not None
 
 
 # --------------------------------------------------------------------------- #

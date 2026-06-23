@@ -7,6 +7,32 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.modules.labeling.service import normalize_label_name
 
 
+# --- Label job request/response schemas ---
+
+class LabelByFileIdsRequest(BaseModel):
+    file_ids: list[uuid.UUID] = Field(min_length=1)
+
+
+class LabelByPathIdsRequest(BaseModel):
+    path_ids: list[uuid.UUID] = Field(min_length=1)
+
+
+class LabelJobEnqueued(BaseModel):
+    job_id: uuid.UUID
+    file_id: uuid.UUID
+    mode: str
+
+
+class LabelJobSkipped(BaseModel):
+    file_id: uuid.UUID
+    reason: str
+
+
+class LabelJobResult(BaseModel):
+    enqueued: list[LabelJobEnqueued]
+    skipped: list[LabelJobSkipped]
+
+
 class LabelBulkCreate(BaseModel):
     names: list[str] = Field(min_length=1)
 
