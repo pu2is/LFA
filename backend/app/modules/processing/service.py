@@ -6,11 +6,82 @@ from langchain_core.language_models import BaseChatModel
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File
+from app.modules.jobs.models import Job
 from app.modules.labeling import service as labeling_service
 from app.modules.processing import cleaning, extraction
 from app.modules.processing.models import ProcessingJob
 from app.modules.rag import service as rag_service
 from app.shared.events import publish_event
+
+
+def _publish_ingest_event(job: Job) -> None:
+    data: dict = {
+        "job_id": str(job.id),
+        "type": job.type,
+        "file_id": str(job.file_id),
+        "status": job.status,
+    }
+    if job.stage:
+        data["stage"] = job.stage
+    if job.error_message:
+        data["error_message"] = job.error_message
+    publish_event("job_status", data)
+
+
+def run_ingest(db: Session, job_id: uuid.UUID) -> Job:
+    """Run extract -> clean -> chunk for the file attached to job_id.
+
+    Uses the unified jobs table (type=ingest). No labeling step -- that is
+    user-triggered via a separate label endpoint (#23).
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise ValueError(f"Job {job_id} not found")
+
+    file = db.get(File, job.file_id)
+    if file is None:
+        raise ValueError(f"File {job.file_id} not found")
+
+    job.status = "running"
+    job.stage = "extract"
+    job.started_at = datetime.now(timezone.utc)
+    file.status = "processing"
+    db.commit()
+    _publish_ingest_event(job)
+
+    try:
+        result = extraction.extract_text(Path(file.full_path), file.file_type)
+    except Exception as exc:
+        job.status = "failed"
+        job.error_message = str(exc)
+        job.completed_at = datetime.now(timezone.utc)
+        file.status = "failed"
+        db.commit()
+        _publish_ingest_event(job)
+        return job
+
+    cleaned_text = cleaning.clean(result.text)
+
+    job.stage = "clean"
+    if result.ocr_applied:
+        file.ocr_applied = True
+    db.commit()
+    _publish_ingest_event(job)
+
+    job.stage = "chunk"
+    db.commit()
+    _publish_ingest_event(job)
+
+    rag_service.chunk_and_store(db, file.id, cleaned_text)
+    db.commit()
+
+    job.status = "succeeded"
+    job.completed_at = datetime.now(timezone.utc)
+    file.status = "ready"
+    db.commit()
+    _publish_ingest_event(job)
+
+    return job
 
 
 def _publish_job_status(job: ProcessingJob) -> None:

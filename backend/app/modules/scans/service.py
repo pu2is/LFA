@@ -2,58 +2,67 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.modules.files import service as files_service
+from app.modules.files.models import File
+from app.modules.jobs.models import Job
 from app.modules.scans import discovery
-from app.modules.scans.models import Scan
 from app.shared.events import publish_event
 
 
-def _publish_scan_status(scan: Scan, file_count: int | None = None) -> None:
+def _publish_job_event(job: Job, **extra) -> None:
     data: dict = {
-        "scan_id": str(scan.id),
-        "path_id": str(scan.path_id),
-        "status": scan.status,
+        "job_id": str(job.id),
+        "type": job.type,
+        "status": job.status,
     }
-    if scan.error_message:
-        data["error_message"] = scan.error_message
-    if file_count is not None:
-        data["file_count"] = file_count
-    publish_event("scan_status", data)
+    if job.path_id:
+        data["path_id"] = str(job.path_id)
+    if job.file_id:
+        data["file_id"] = str(job.file_id)
+    if job.stage:
+        data["stage"] = job.stage
+    if job.error_message:
+        data["error_message"] = job.error_message
+    data.update(extra)
+    publish_event("job_status", data)
 
 
-def create_scan(db: Session, path_id: uuid.UUID) -> Scan:
-    scan = Scan(path_id=path_id, status="queued")
-    db.add(scan)
+def create_scan(db: Session, path_id: uuid.UUID) -> Job:
+    job = Job(type="scan", path_id=path_id, trigger="scan", mode="initial")
+    db.add(job)
     db.commit()
-    db.refresh(scan)
-    return scan
+    db.refresh(job)
+    return job
 
 
-def get_scan(db: Session, scan_id: uuid.UUID) -> Scan | None:
-    return db.get(Scan, scan_id)
+def get_scan(db: Session, scan_id: uuid.UUID) -> Job | None:
+    job = db.get(Job, scan_id)
+    if job is not None and job.type != "scan":
+        return None
+    return job
 
 
-def run_scan(db: Session, scan_id: uuid.UUID) -> Scan:
-    """Walk the scan's registered path and upsert a File row per supported document.
+def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
+    """Walk the scan's registered path, upsert File rows, and fan-out ingest jobs.
 
-    Synchronous on purpose (issue #4 "sync core"): no RQ enqueue, OCR, text
-    extraction, embeddings, or move-detection diffing here. Those build on
-    top of the File rows this function writes.
+    Returns the scan job and a list of ingest jobs created for discovered files.
+    The caller (RQ task) is responsible for enqueuing the ingest jobs.
     """
-    scan = db.get(Scan, scan_id)
-    if scan is None:
-        raise ValueError(f"Scan {scan_id} not found")
+    scan_job = db.get(Job, scan_id)
+    if scan_job is None:
+        raise ValueError(f"Job {scan_id} not found")
 
-    registered_path = files_service.get_path(db, scan.path_id)
+    registered_path = files_service.get_path(db, scan_job.path_id)
     if registered_path is None:
-        raise ValueError(f"Registered path {scan.path_id} not found")
+        raise ValueError(f"Registered path {scan_job.path_id} not found")
 
-    scan.status = "running"
-    scan.started_at = datetime.now(timezone.utc)
+    scan_job.status = "running"
+    scan_job.started_at = datetime.now(timezone.utc)
     db.commit()
-    _publish_scan_status(scan)
+    _publish_job_event(scan_job)
 
     try:
         for doc in discovery.iter_documents(Path(registered_path.path)):
@@ -69,20 +78,39 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> Scan:
                 file_modified_at=doc.file_modified_at,
             )
     except OSError as exc:
-        # Keep whatever files were already upserted before the error -- the
-        # scan can simply be re-run later (upsert is idempotent) to pick up
-        # the rest, instead of throwing away partial progress.
-        scan.status = "failed"
-        scan.error_message = str(exc)
-        scan.completed_at = datetime.now(timezone.utc)
+        scan_job.status = "failed"
+        scan_job.error_message = str(exc)
+        scan_job.completed_at = datetime.now(timezone.utc)
         db.commit()
-        _publish_scan_status(scan)
-        return scan
+        _publish_job_event(scan_job)
+        return scan_job, []
 
-    file_count = files_service.count_files_by_path(db, scan.path_id)
-    scan.status = "completed"
-    scan.completed_at = datetime.now(timezone.utc)
-    registered_path.last_scanned_at = scan.completed_at
+    file_count = files_service.count_files_by_path(db, scan_job.path_id)
+    scan_job.status = "succeeded"
+    scan_job.completed_at = datetime.now(timezone.utc)
+    registered_path.last_scanned_at = scan_job.completed_at
     db.commit()
-    _publish_scan_status(scan, file_count=file_count)
-    return scan
+    _publish_job_event(scan_job, file_count=file_count)
+
+    # Fan-out: create one ingest job per discovered file under this path.
+    discovered_files = list(db.scalars(
+        select(File)
+        .where(File.path_id == scan_job.path_id, File.status == "discovered")
+    ))
+    ingest_jobs: list[Job] = []
+    for file in discovered_files:
+        ingest_job = Job(
+            type="ingest",
+            file_id=file.id,
+            parent_job_id=scan_job.id,
+            trigger="scan",
+        )
+        db.add(ingest_job)
+        ingest_jobs.append(ingest_job)
+
+    if ingest_jobs:
+        db.commit()
+        for job in ingest_jobs:
+            db.refresh(job)
+
+    return scan_job, ingest_jobs

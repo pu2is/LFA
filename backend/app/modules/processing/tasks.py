@@ -6,6 +6,18 @@ from app.shared.database import SessionLocal
 from app.shared.queue import embedding_queue
 
 
+def run_ingest_job(job_id: uuid.UUID) -> None:
+    """RQ entrypoint for an ingest job (extract -> clean -> chunk).
+
+    Uses the unified jobs table. No labeling -- that is a separate manual step.
+    """
+    db = SessionLocal()
+    try:
+        service.run_ingest(db, job_id)
+    finally:
+        db.close()
+
+
 def run_relabel_job(job_id: uuid.UUID) -> None:
     """RQ entrypoint for a re-labeling job (WF1c).
 
