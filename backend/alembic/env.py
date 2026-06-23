@@ -8,6 +8,7 @@ from alembic import context
 from app.shared.config import settings
 from app.shared.database import Base
 from app.modules.files import models as files_models  # noqa: F401 - registers RegisteredPath, File on Base.metadata
+from app.modules.jobs import models as jobs_models  # noqa: F401 - registers Job on Base.metadata
 from app.modules.labeling import models as labeling_models  # noqa: F401 - registers Label, FileLabel on Base.metadata
 from app.modules.processing import models as processing_models  # noqa: F401 - registers ProcessingJob on Base.metadata
 from app.modules.rag import models as rag_models  # noqa: F401 - registers FileChunk on Base.metadata
