@@ -18,6 +18,7 @@ from app.modules.labeling.service import (
     CatalogCandidate,
     FreetextCandidate,
     LabelSuggestionOutput,
+    normalize_label_name,
     suggest_labels,
 )
 from app.modules.rag.models import FileChunk
@@ -366,3 +367,115 @@ def test_confirmed_freetext_label_is_not_changed(db):
         db.delete(f)
         db.delete(path)
         db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Normalization consistency
+# --------------------------------------------------------------------------- #
+
+def test_normalize_label_name_replaces_spaces_with_underscores():
+    assert normalize_label_name("Bank Statement") == "bank_statement"
+    assert normalize_label_name("  Tax  ") == "tax"
+    assert normalize_label_name("INVOICE") == "invoice"
+    assert normalize_label_name("car_rental_agreement") == "car_rental_agreement"
+
+
+# --------------------------------------------------------------------------- #
+# Free-text → catalog promotion (regression for issue #13)
+# --------------------------------------------------------------------------- #
+
+def test_freetext_promoted_to_catalog_on_relabel(db):
+    """Free-text row promoted to catalog row when the same name is later in the catalog.
+
+    Scenario: LLM first suggests "car_rental" as free-text (label_id=NULL).
+    User later adds "car_rental" to the catalog. Re-labeling must promote the
+    existing free-text row (set label_id) instead of inserting a duplicate,
+    which would violate the uq_file_labels_name unique index.
+    """
+    freetext_name = "mrg_t8_car_rental"
+    path_str = "/tmp/lfa_merge_t8"
+
+    path = RegisteredPath(path=path_str)
+    db.add(path)
+    db.flush()
+
+    f = File(
+        path_id=path.id, filename="t8.pdf", full_path=f"{path_str}/t8.pdf",
+        file_type="pdf", file_size=100, file_hash="mrg_hash_t8",
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add(f)
+    db.flush()
+    db.add(FileChunk(file_id=f.id, chunk_index=0, content="content"))
+
+    # Step 1: a free-text row exists (from a previous labeling run).
+    existing_fl = FileLabel(
+        file_id=f.id, label_id=None, label_name=freetext_name,
+        source="llm", status="suggested", confidence=0.6,
+    )
+    db.add(existing_fl)
+    db.flush()
+    original_fl_id = existing_fl.id
+
+    # Step 2: user adds the same name to the catalog.
+    lbl = Label(name=freetext_name)
+    db.add(lbl)
+    db.commit()
+
+    # Step 3: re-label — LLM returns the name as a catalog pick.
+    llm = _mock_llm(catalog=[(freetext_name, 0.9)])
+    result = suggest_labels(db, f.id, llm=llm)
+
+    # The original row should be promoted (same PK), not a new row inserted.
+    from sqlalchemy import select as sa_select
+    all_fl = list(db.scalars(sa_select(FileLabel).where(FileLabel.file_id == f.id)))
+    assert len(all_fl) == 1, f"Expected exactly 1 file_label row, got {len(all_fl)}"
+
+    promoted = all_fl[0]
+    assert promoted.id == original_fl_id
+    assert promoted.label_id == lbl.id
+    assert promoted.label_name == freetext_name
+    assert promoted.status == "suggested"
+    assert promoted.confidence == 0.9
+
+
+def test_confirmed_freetext_promoted_keeps_confirmed_status(db):
+    """A confirmed free-text row promoted to catalog keeps confirmed status."""
+    freetext_name = "mrg_t9_lease"
+    path_str = "/tmp/lfa_merge_t9"
+
+    path = RegisteredPath(path=path_str)
+    db.add(path)
+    db.flush()
+
+    f = File(
+        path_id=path.id, filename="t9.pdf", full_path=f"{path_str}/t9.pdf",
+        file_type="pdf", file_size=100, file_hash="mrg_hash_t9",
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add(f)
+    db.flush()
+    db.add(FileChunk(file_id=f.id, chunk_index=0, content="content"))
+
+    existing_fl = FileLabel(
+        file_id=f.id, label_id=None, label_name=freetext_name,
+        source="llm", status="confirmed", confidence=0.7,
+    )
+    db.add(existing_fl)
+    db.flush()
+
+    lbl = Label(name=freetext_name)
+    db.add(lbl)
+    db.commit()
+
+    llm = _mock_llm(catalog=[(freetext_name, 0.5)])
+    suggest_labels(db, f.id, llm=llm)
+
+    from sqlalchemy import select as sa_select
+    all_fl = list(db.scalars(sa_select(FileLabel).where(FileLabel.file_id == f.id)))
+    assert len(all_fl) == 1
+
+    promoted = all_fl[0]
+    assert promoted.label_id == lbl.id
+    assert promoted.status == "confirmed"
+    assert promoted.confidence == 0.7

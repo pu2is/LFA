@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.modules.labeling.service import normalize_label_name
+
 
 class LabelBulkCreate(BaseModel):
     names: list[str] = Field(min_length=1)
@@ -13,7 +15,7 @@ class LabelBulkCreate(BaseModel):
     def normalize_names(cls, values: list[str]) -> list[str]:
         normalized = []
         for value in values:
-            cleaned = value.strip().lower()
+            cleaned = normalize_label_name(value)
             if not cleaned:
                 raise ValueError("Label name must not be empty or whitespace")
             normalized.append(cleaned)

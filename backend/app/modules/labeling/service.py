@@ -24,6 +24,10 @@ CONFIDENCE_THRESHOLD_DROP = 0.0
 CONFIDENCE_THRESHOLD_HIGH = 0.75
 
 
+def normalize_label_name(raw: str) -> str:
+    return raw.strip().lower().replace(" ", "_")
+
+
 
 # --------------------------------------------------------------------------- #
 # LLM output schema
@@ -155,10 +159,10 @@ def _merge_candidates(
     }
     # Free-text rows (label_id IS NULL) keyed by normalised label_name.
     by_free_name: dict[str, FileLabel] = {
-        fl.label_name.lower(): fl for fl in existing if fl.label_id is None
+        normalize_label_name(fl.label_name): fl for fl in existing if fl.label_id is None
     }
 
-    label_by_name = {lbl.name.lower(): lbl for lbl in labels}
+    label_by_name = {normalize_label_name(lbl.name): lbl for lbl in labels}
     file_labels: list[FileLabel] = []
     seen_label_ids: set[uuid.UUID] = set()
 
@@ -166,7 +170,8 @@ def _merge_candidates(
     for candidate in output.catalog_picks:
         if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
             continue
-        lbl = label_by_name.get(candidate.name.lower())
+        norm = normalize_label_name(candidate.name)
+        lbl = label_by_name.get(norm)
         if lbl is None:
             logger.debug("_merge_candidates: catalog pick %r not in label catalog — skipping", candidate.name)
             continue
@@ -181,23 +186,34 @@ def _merge_candidates(
                 existing_fl.confidence = candidate.confidence
                 file_labels.append(existing_fl)
         else:
-            fl = FileLabel(
-                file_id=file_id,
-                label_id=lbl.id,
-                label_name=lbl.name,
-                source="llm",
-                status="suggested",
-                confidence=candidate.confidence,
-            )
-            db.add(fl)
-            file_labels.append(fl)
+            # Promote: if a free-text row with the same name already exists,
+            # upgrade it to a catalog row instead of inserting a duplicate.
+            free_fl = by_free_name.pop(norm, None)
+            if free_fl is not None:
+                free_fl.label_id = lbl.id
+                free_fl.label_name = lbl.name
+                if free_fl.status != "confirmed":
+                    free_fl.status = "suggested"
+                    free_fl.confidence = candidate.confidence
+                file_labels.append(free_fl)
+            else:
+                fl = FileLabel(
+                    file_id=file_id,
+                    label_id=lbl.id,
+                    label_name=lbl.name,
+                    source="llm",
+                    status="suggested",
+                    confidence=candidate.confidence,
+                )
+                db.add(fl)
+                file_labels.append(fl)
 
     # --- Path B: free-text suggestions ---
     seen_free_names: set[str] = set()
     for candidate in output.free_suggestions:
         if candidate.confidence < CONFIDENCE_THRESHOLD_DROP:
             continue
-        normalized = candidate.name.strip().lower().replace(" ", "_")
+        normalized = normalize_label_name(candidate.name)
         if not normalized:
             continue
         if normalized in label_by_name:
