@@ -1,11 +1,11 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
-from app.modules.processing.models import ProcessingJob
+from app.modules.jobs.models import Job
 
 
 def get_path_by_value(db: Session, path: str) -> RegisteredPath | None:
@@ -39,17 +39,17 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
 
 def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File, str | None, str | None]]:
     latest_job_status = (
-        select(ProcessingJob.status)
-        .where(ProcessingJob.file_id == File.id)
-        .order_by(ProcessingJob.created_at.desc())
+        select(Job.status)
+        .where(Job.file_id == File.id, Job.type == "ingest")
+        .order_by(Job.created_at.desc())
         .limit(1)
         .correlate(File)
         .scalar_subquery()
     )
     latest_job_error = (
-        select(ProcessingJob.error_message)
-        .where(ProcessingJob.file_id == File.id)
-        .order_by(ProcessingJob.created_at.desc())
+        select(Job.error_message)
+        .where(Job.file_id == File.id, Job.type == "ingest")
+        .order_by(Job.created_at.desc())
         .limit(1)
         .correlate(File)
         .scalar_subquery()
@@ -65,7 +65,9 @@ def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File
 
 
 def count_files_by_path(db: Session, path_id: uuid.UUID) -> int:
-    return db.query(File).filter_by(path_id=path_id).count()
+    return db.scalar(
+        select(func.count()).select_from(File).where(File.path_id == path_id)
+    )
 
 
 def upsert_file(

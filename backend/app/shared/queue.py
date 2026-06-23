@@ -11,7 +11,12 @@ scan_queue = Queue(
     connection=redis_connection,
 )
 
-# process: ocr -> chunk -> labeling
+ingest_queue = Queue(
+    name="ingest",
+    connection=redis_connection,
+)
+
+# process: ocr -> chunk -> labeling (legacy; will be replaced by /label in #23)
 labeling_queue = Queue(
     name="labeling",
     connection=redis_connection,

@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
+from app.modules.jobs.models import Job
 from app.modules.processing.models import ProcessingJob
 
 # Fake path string — doesn't need to exist on disk because we insert directly into DB.
@@ -157,8 +158,8 @@ def test_post_process_paths_unknown_id_returns_404(mock_q, client):
 def test_get_files_returns_processing_job_status(client, db: Session, path_and_discovered_file):
     path, file = path_and_discovered_file
 
-    # Directly insert a ProcessingJob so we don't need RQ.
-    job = ProcessingJob(file_id=file.id, triggered_by="manual", status="labeling")
+    # Insert an ingest Job (unified jobs table) so we don't need RQ.
+    job = Job(type="ingest", file_id=file.id, trigger="scan", status="running", stage="extract")
     db.add(job)
     db.commit()
 
@@ -169,7 +170,7 @@ def test_get_files_returns_processing_job_status(client, db: Session, path_and_d
     assert len(data) == 1
     assert data[0]["id"] == str(file.id)
     assert data[0]["status"] == "discovered"
-    assert data[0]["processing_job_status"] == "labeling"
+    assert data[0]["processing_job_status"] == "running"
 
 
 def test_get_files_processing_job_status_is_none_when_no_job(client, path_and_discovered_file):
