@@ -10,15 +10,20 @@ namespace after the dict is built has no effect.  patch.dict on _LOADERS is
 the correct approach.
 """
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.modules.processing import extraction
 from app.modules.processing.extraction import (
+    CONFIDENCE_THRESHOLD,
+    MIN_TEXT_GUARD,
     OCR_THRESHOLD,
     ExtractionResult,
+    OcrResult,
     _extract_doc,
+    _needs_chinese_fallback,
     extract_text,
 )
 
@@ -158,3 +163,101 @@ class TestDocExtraction:
         mock_extract.assert_called_once_with(doc)
         assert result.text == "Content extracted from legacy doc."
         assert result.ocr_applied is False
+
+
+class TestOcrResult:
+    def test_avg_confidence_with_values(self):
+        r = OcrResult(text="hello", confidences=[0.8, 0.6, 0.9])
+        assert r.avg_confidence == pytest.approx(0.7667, abs=0.001)
+
+    def test_avg_confidence_empty(self):
+        r = OcrResult(text="", confidences=[])
+        assert r.avg_confidence == 0.0
+
+
+class TestNeedsChineseFallback:
+    """Unit tests for the confidence-based fallback decision."""
+
+    def test_high_confidence_long_text_skips_chinese(self):
+        latin = OcrResult(text="A" * MIN_TEXT_GUARD, confidences=[0.9, 0.85, 0.88])
+        assert _needs_chinese_fallback(latin) is False
+
+    def test_low_confidence_triggers_chinese(self):
+        latin = OcrResult(text="A" * 100, confidences=[0.2, 0.3, 0.1])
+        assert _needs_chinese_fallback(latin) is True
+
+    def test_short_text_triggers_chinese_even_with_high_confidence(self):
+        latin = OcrResult(text="Hi", confidences=[0.95])
+        assert _needs_chinese_fallback(latin) is True
+
+    def test_no_detections_triggers_chinese(self):
+        latin = OcrResult(text="", confidences=[])
+        assert _needs_chinese_fallback(latin) is True
+
+    def test_confidence_exactly_at_threshold_skips_chinese(self):
+        latin = OcrResult(text="A" * MIN_TEXT_GUARD, confidences=[CONFIDENCE_THRESHOLD])
+        assert _needs_chinese_fallback(latin) is False
+
+
+class TestConfidenceBasedOcrFallback:
+    """Integration-level tests for _extract_pdf_with_ocr with mocked readers."""
+
+    def test_latin_high_confidence_does_not_load_chinese(self):
+        latin_detections = [([0, 0, 1, 1], "Rechnung vom Mai", 0.92)]
+
+        page = MagicMock()
+        page.get_pixmap.return_value.tobytes.return_value = b"fake-png"
+        doc = MagicMock()
+        doc.__iter__ = lambda self: iter([page])
+
+        with (
+            patch("app.modules.processing.extraction.fitz.open", return_value=doc),
+            patch("app.modules.processing.extraction._get_latin_reader") as mock_latin,
+            patch("app.modules.processing.extraction._get_chinese_reader") as mock_chinese,
+        ):
+            mock_latin.return_value.readtext.return_value = latin_detections
+            result = extraction._extract_pdf_with_ocr(Path("fake.pdf"))
+
+        assert result == "Rechnung vom Mai"
+        mock_chinese.assert_not_called()
+
+    def test_latin_low_confidence_triggers_chinese_and_keeps_longer(self):
+        latin_detections = [([0, 0, 1, 1], "??", 0.15)]
+        chinese_detections = [([0, 0, 1, 1], "这是一份中文文件的内容", 0.88)]
+
+        page = MagicMock()
+        page.get_pixmap.return_value.tobytes.return_value = b"fake-png"
+        doc = MagicMock()
+        doc.__iter__ = lambda self: iter([page])
+
+        with (
+            patch("app.modules.processing.extraction.fitz.open", return_value=doc),
+            patch("app.modules.processing.extraction._get_latin_reader") as mock_latin,
+            patch("app.modules.processing.extraction._get_chinese_reader") as mock_chinese,
+        ):
+            mock_latin.return_value.readtext.return_value = latin_detections
+            mock_chinese.return_value.readtext.return_value = chinese_detections
+            result = extraction._extract_pdf_with_ocr(Path("fake.pdf"))
+
+        assert result == "这是一份中文文件的内容"
+        mock_chinese.assert_called_once()
+
+    def test_latin_low_confidence_keeps_latin_when_longer(self):
+        latin_detections = [([0, 0, 1, 1], "Some garbled text here", 0.3)]
+        chinese_detections = [([0, 0, 1, 1], "短", 0.4)]
+
+        page = MagicMock()
+        page.get_pixmap.return_value.tobytes.return_value = b"fake-png"
+        doc = MagicMock()
+        doc.__iter__ = lambda self: iter([page])
+
+        with (
+            patch("app.modules.processing.extraction.fitz.open", return_value=doc),
+            patch("app.modules.processing.extraction._get_latin_reader") as mock_latin,
+            patch("app.modules.processing.extraction._get_chinese_reader") as mock_chinese,
+        ):
+            mock_latin.return_value.readtext.return_value = latin_detections
+            mock_chinese.return_value.readtext.return_value = chinese_detections
+            result = extraction._extract_pdf_with_ocr(Path("fake.pdf"))
+
+        assert result == "Some garbled text here"

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 import fitz  # pymupdf — bundles MuPDF statically, no external binary needed
 import easyocr
@@ -23,7 +24,11 @@ OCR_THRESHOLD = 50
 _latin_reader: easyocr.Reader | None = None
 _chinese_reader: easyocr.Reader | None = None
 
-CHINESE_FALLBACK_THRESHOLD = 10
+# If Latin reader's average confidence is below this, try the Chinese reader.
+CONFIDENCE_THRESHOLD = 0.5
+# Even if confidence looks okay, if total text is shorter than this,
+# the Latin reader probably missed most of the content — try Chinese too.
+MIN_TEXT_GUARD = 10
 
 
 def _get_latin_reader() -> easyocr.Reader:
@@ -38,6 +43,17 @@ def _get_chinese_reader() -> easyocr.Reader:
     if _chinese_reader is None:
         _chinese_reader = easyocr.Reader(["ch_sim", "en"], gpu=False)
     return _chinese_reader
+
+
+@dataclass
+class OcrResult:
+    """Internal container for raw EasyOCR output (text + per-detection confidences)."""
+    text: str
+    confidences: Sequence[float]
+
+    @property
+    def avg_confidence(self) -> float:
+        return sum(self.confidences) / len(self.confidences) if self.confidences else 0.0
 
 
 @dataclass
@@ -77,32 +93,44 @@ def _extract_doc(path: Path) -> str:
         return "\n".join(p.page_content for p in pages)
 
 
-def _ocr_pages(reader: easyocr.Reader, doc) -> str:
+def _ocr_pages(reader: easyocr.Reader, doc) -> OcrResult:
     page_texts: list[str] = []
+    all_confidences: list[float] = []
     for page in doc:
         img_bytes = page.get_pixmap(dpi=300).tobytes("png")
-        results = reader.readtext(img_bytes)
-        page_texts.append("\n".join(r[1] for r in results))
-    return "\n".join(page_texts)
+        detections = reader.readtext(img_bytes)
+        page_texts.append("\n".join(d[1] for d in detections))
+        all_confidences.extend(d[2] for d in detections)
+    return OcrResult(text="\n".join(page_texts), confidences=all_confidences)
+
+
+def _needs_chinese_fallback(latin: OcrResult) -> bool:
+    """Decide whether the Chinese reader should be tried.
+
+    Triggers when the Latin reader is not confident about its output OR
+    when it extracted very little text (low-text guard).
+    """
+    return latin.avg_confidence < CONFIDENCE_THRESHOLD or len(latin.text.strip()) < MIN_TEXT_GUARD
 
 
 def _extract_pdf_with_ocr(path: Path) -> str:
     """OCR fallback for scanned PDFs using EasyOCR + PyMuPDF (no external binaries).
 
-    Tries Latin (en+de) first; if result is too short, also tries Chinese
-    (ch_sim+en) and keeps whichever produced more text.
+    Runs the Latin (en+de) reader first. If average confidence is below
+    CONFIDENCE_THRESHOLD or the extracted text is shorter than MIN_TEXT_GUARD,
+    also runs the Chinese (ch_sim+en) reader and keeps the stronger output.
     """
     doc = fitz.open(str(path))
-    latin_text = _ocr_pages(_get_latin_reader(), doc)
+    latin = _ocr_pages(_get_latin_reader(), doc)
 
-    if len(latin_text.strip()) >= CHINESE_FALLBACK_THRESHOLD:
+    if not _needs_chinese_fallback(latin):
         doc.close()
-        return latin_text
+        return latin.text
 
-    chinese_text = _ocr_pages(_get_chinese_reader(), doc)
+    chinese = _ocr_pages(_get_chinese_reader(), doc)
     doc.close()
 
-    return chinese_text if len(chinese_text.strip()) > len(latin_text.strip()) else latin_text
+    return chinese.text if len(chinese.text.strip()) > len(latin.text.strip()) else latin.text
 
 
 def extract_text(path: Path, file_type: str) -> ExtractionResult:
