@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
+from app.modules.labeling.models import FileLabel, Label
 
 _FAKE_PATH = "D:/lfa_test_label_routes"
 
@@ -68,6 +69,44 @@ def path_with_mixed_files(db: Session):
     yield path, ready, discovered
 
 
+@pytest.fixture
+def ready_file_with_labels(db: Session):
+    """A ready file that already has file_labels — triggers augment mode."""
+    path = RegisteredPath(path=_FAKE_PATH)
+    db.add(path)
+    db.flush()
+
+    file = File(
+        path_id=path.id,
+        filename="labeled.pdf",
+        full_path=f"{_FAKE_PATH}/labeled.pdf",
+        file_type="pdf",
+        file_size=2048,
+        file_hash="cafebabe" * 8,
+        file_modified_at=datetime.now(timezone.utc),
+        status="ready",
+    )
+    db.add(file)
+    db.flush()
+
+    lbl = Label(name="lr_test_invoice")
+    db.add(lbl)
+    db.flush()
+
+    fl = FileLabel(
+        file_id=file.id,
+        label_id=lbl.id,
+        label_name=lbl.name,
+        source="llm",
+        status="confirmed",
+        confidence=0.9,
+    )
+    db.add(fl)
+    db.commit()
+    db.refresh(file)
+    yield path, file
+
+
 def _mock_rq_job() -> MagicMock:
     rq_job = MagicMock()
     rq_job.id = str(uuid.uuid4())
@@ -116,6 +155,23 @@ def test_label_files_unknown_id_returns_404(mock_q, client):
     resp = client.post("/label/files", json={"file_ids": [str(uuid.uuid4())]})
     assert resp.status_code == 404
     mock_q.enqueue.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# POST /label/files — augment mode
+# ---------------------------------------------------------------------------
+
+@patch("app.modules.labeling.routes.labeling_queue")
+def test_label_files_augment_for_labeled_file(mock_q, client, ready_file_with_labels):
+    _, file = ready_file_with_labels
+    mock_q.enqueue.return_value = _mock_rq_job()
+
+    resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
+
+    assert resp.status_code == 202
+    data = resp.json()
+    assert len(data["enqueued"]) == 1
+    assert data["enqueued"][0]["mode"] == "augment"
 
 
 # ---------------------------------------------------------------------------
