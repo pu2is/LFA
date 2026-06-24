@@ -117,7 +117,7 @@ def _mock_rq_job() -> MagicMock:
 # POST /label/files — initial mode
 # ---------------------------------------------------------------------------
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_files_initial_returns_202(mock_q, client, path_and_ready_file):
     _, file = path_and_ready_file
     mock_q.enqueue.return_value = _mock_rq_job()
@@ -132,7 +132,7 @@ def test_label_files_initial_returns_202(mock_q, client, path_and_ready_file):
     assert data["skipped"] == []
 
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_files_skips_non_ready(mock_q, client, path_with_mixed_files):
     _, ready, discovered = path_with_mixed_files
     mock_q.enqueue.return_value = _mock_rq_job()
@@ -150,7 +150,7 @@ def test_label_files_skips_non_ready(mock_q, client, path_with_mixed_files):
     assert data["skipped"][0]["file_id"] == str(discovered.id)
 
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_files_unknown_id_returns_404(mock_q, client):
     resp = client.post("/label/files", json={"file_ids": [str(uuid.uuid4())]})
     assert resp.status_code == 404
@@ -161,7 +161,7 @@ def test_label_files_unknown_id_returns_404(mock_q, client):
 # POST /label/files — augment mode
 # ---------------------------------------------------------------------------
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_files_augment_for_labeled_file(mock_q, client, ready_file_with_labels):
     _, file = ready_file_with_labels
     mock_q.enqueue.return_value = _mock_rq_job()
@@ -178,7 +178,7 @@ def test_label_files_augment_for_labeled_file(mock_q, client, ready_file_with_la
 # POST /label/files — creates correct Job row
 # ---------------------------------------------------------------------------
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_files_creates_job_in_db(mock_q, client, db, path_and_ready_file):
     _, file = path_and_ready_file
     mock_q.enqueue.return_value = _mock_rq_job()
@@ -199,7 +199,7 @@ def test_label_files_creates_job_in_db(mock_q, client, db, path_and_ready_file):
 # POST /label/paths
 # ---------------------------------------------------------------------------
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_paths_enqueues_ready_files(mock_q, client, path_with_mixed_files):
     path, ready, _discovered = path_with_mixed_files
     mock_q.enqueue.return_value = _mock_rq_job()
@@ -212,7 +212,7 @@ def test_label_paths_enqueues_ready_files(mock_q, client, path_with_mixed_files)
     assert str(ready.id) in enqueued_file_ids
 
 
-@patch("app.modules.labeling.routes.labeling_queue")
+@patch("app.modules.labeling.routes.label_queue")
 def test_label_paths_unknown_path_returns_404(mock_q, client):
     resp = client.post("/label/paths", json={"path_ids": [str(uuid.uuid4())]})
     assert resp.status_code == 404
