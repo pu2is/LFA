@@ -10,11 +10,12 @@ def run_ingest_job(job_id: uuid.UUID) -> None:
     """RQ entrypoint for an ingest job (extract -> clean -> chunk).
 
     Uses the unified jobs table. No labeling -- that is a separate manual step.
+    On success, fans out one embed job (same pattern as scan -> ingest).
     """
     db = SessionLocal()
     try:
-        job = service.run_ingest(db, job_id)
-        if job.status == "succeeded":
-            embedding_queue.enqueue(run_embedding_job, job.file_id)
+        _ingest_job, embed_job = service.run_ingest(db, job_id)
+        if embed_job is not None:
+            embedding_queue.enqueue(run_embedding_job, embed_job.id)
     finally:
         db.close()

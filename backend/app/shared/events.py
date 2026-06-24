@@ -3,14 +3,20 @@
 Infrastructure layer (like queue.py). Business modules call publish_event()
 to broadcast status changes; the events module subscribes and streams to
 clients via SSE.
+
+publish_event() uses a sync Redis client (called from RQ workers).
+async_subscribe_events() uses redis.asyncio for the SSE endpoint, giving
+deterministic cleanup when the client disconnects.
 """
 
 import json
 import logging
+from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
-from typing import Any, Generator
+from typing import Any
 
 from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 
 from app.shared.config import settings
 
@@ -32,22 +38,24 @@ def publish_event(event_type: str, data: dict[str, Any]) -> None:
         logger.debug("Failed to publish event (Redis may be unavailable)", exc_info=True)
 
 
-def subscribe_events() -> Generator[dict[str, Any] | None, None, None]:
-    """Subscribe to the Redis channel and yield parsed events.
+async def async_subscribe_events() -> AsyncGenerator[dict[str, Any], None]:
+    """Async subscribe to the Redis channel and yield parsed events.
 
-    Uses get_message(timeout=30) instead of listen() to avoid blocking
-    forever — when no message arrives within the timeout window, yields
-    None so the caller can send an SSE keepalive comment.
+    Uses redis.asyncio so the generator runs in the event loop, not a
+    threadpool thread. When the SSE client disconnects, EventSourceResponse
+    cancels the task, triggering the finally block for deterministic cleanup.
+    Keepalive is handled by EventSourceResponse's ping parameter, not here.
     """
-    conn = Redis.from_url(settings.redis_url, socket_timeout=None)
+    conn = AsyncRedis.from_url(settings.redis_url, socket_timeout=None)
     pubsub = conn.pubsub()
-    pubsub.subscribe(CHANNEL)
+    await pubsub.subscribe(CHANNEL)
 
     try:
         while True:
-            message = pubsub.get_message(timeout=30)
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=5.0,
+            )
             if message is None:
-                yield None
                 continue
             if message["type"] != "message":
                 continue
@@ -56,6 +64,6 @@ def subscribe_events() -> Generator[dict[str, Any] | None, None, None]:
             except (json.JSONDecodeError, TypeError):
                 continue
     finally:
-        pubsub.unsubscribe(CHANNEL)
-        pubsub.close()
-        conn.close()
+        await pubsub.unsubscribe(CHANNEL)
+        await pubsub.aclose()
+        await conn.aclose()

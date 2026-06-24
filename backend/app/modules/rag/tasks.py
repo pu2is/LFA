@@ -4,14 +4,14 @@ from app.modules.rag import service
 from app.shared.database import SessionLocal
 
 
-def run_embedding_job(file_id: uuid.UUID) -> None:
-    """RQ entrypoint for Job2 (embedding).
+def run_embedding_job(job_id: uuid.UUID) -> None:
+    """RQ entrypoint for an embed job.
 
-    Runs in the worker process — opens its own DB session, same pattern as
-    processing/tasks.py and scans/tasks.py.
+    Delegates to service.run_embed() which manages job lifecycle
+    (status, timestamps, events) and calls embed_file().
     """
     db = SessionLocal()
     try:
-        service.embed_file(db, file_id)
+        service.run_embed(db, job_id)
     finally:
         db.close()

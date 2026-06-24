@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -6,8 +7,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File
+from app.modules.jobs.models import Job
 from app.modules.rag.models import EMBEDDING_DIMENSIONS, FileChunk
 from app.shared.config import settings
+from app.shared.events import publish_event
 
 # Sized for the labeling step (#8), which only reads the first chunk or two --
 # large enough to cover a full paragraph, small enough to leave room in the
@@ -82,3 +85,53 @@ def embed_file(
         file.embedding_status = "failed"
         db.commit()
         raise
+
+
+def _publish_embed_event(job: Job) -> None:
+    data: dict = {
+        "job_id": str(job.id),
+        "type": job.type,
+        "file_id": str(job.file_id),
+        "status": job.status,
+    }
+    if job.error_message:
+        data["error_message"] = job.error_message
+    publish_event("job_status", data)
+
+
+def run_embed(
+    db: Session,
+    job_id: uuid.UUID,
+    *,
+    embeddings: OllamaEmbeddings | None = None,
+) -> Job:
+    """Execute an embed job: backfill chunk vectors for the attached file.
+
+    Manages job lifecycle (status, timestamps, events) then delegates the
+    actual embedding work to embed_file().
+    """
+    job = db.get(Job, job_id)
+    if job is None:
+        raise ValueError(f"Job {job_id} not found")
+
+    job.status = "running"
+    job.started_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_embed_event(job)
+
+    try:
+        embed_file(db, job.file_id, embeddings=embeddings)
+    except Exception as exc:
+        job.status = "failed"
+        job.error_message = str(exc)
+        job.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        _publish_embed_event(job)
+        raise
+
+    job.status = "succeeded"
+    job.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_embed_event(job)
+
+    return job

@@ -25,11 +25,13 @@ def _publish_ingest_event(job: Job) -> None:
     publish_event("job_status", data)
 
 
-def run_ingest(db: Session, job_id: uuid.UUID) -> Job:
+def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
     """Run extract -> clean -> chunk for the file attached to job_id.
 
     Uses the unified jobs table (type=ingest). No labeling step -- that is
     user-triggered via a separate label endpoint (#23).
+
+    Returns (ingest_job, embed_job). embed_job is None when ingest failed.
     """
     job = db.get(Job, job_id)
     if job is None:
@@ -55,7 +57,7 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> Job:
         file.status = "failed"
         db.commit()
         _publish_ingest_event(job)
-        return job
+        return job, None
 
     cleaned_text = cleaning.clean(result.text)
 
@@ -78,6 +80,16 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> Job:
     db.commit()
     _publish_ingest_event(job)
 
-    return job
+    embed_job = Job(
+        type="embed",
+        file_id=file.id,
+        parent_job_id=job.id,
+        trigger="scan",
+    )
+    db.add(embed_job)
+    db.commit()
+    db.refresh(embed_job)
+
+    return job, embed_job
 
 
