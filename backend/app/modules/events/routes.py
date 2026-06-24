@@ -1,43 +1,33 @@
 """SSE endpoint for real-time event streaming to the frontend.
 
-Subscribes to the shared Redis pub/sub channel and yields events in
-Server-Sent Events format over a long-lived HTTP response.
+Contract (snapshot + stream):
+  1. Client fetches GET /files (or any list endpoint) for the current snapshot.
+  2. Client subscribes to GET /events/stream for incremental SSE deltas.
+  3. DB is the source of truth — if a client misses events (reconnect gap),
+     it re-fetches the snapshot; no server-side replay is needed.
 """
 
 import json
+from collections.abc import AsyncGenerator
 
 from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
-from app.shared.events import subscribe_events
+from app.shared.events import async_subscribe_events
 
 router = APIRouter(prefix="/events", tags=["events"])
 
 
-def _sse_stream():
-    """Synchronous generator that yields SSE-formatted lines.
-
-    subscribe_events() yields None on timeout (no message within 30s).
-    We send an SSE comment (: keepalive) to prevent proxies and browsers
-    from closing the idle connection.
-    """
-    for event in subscribe_events():
-        if event is None:
-            yield ": keepalive\n\n"
-            continue
+async def _event_generator() -> AsyncGenerator[ServerSentEvent, None]:
+    async for event in async_subscribe_events():
         event_type = event.get("event", "message")
         data_json = json.dumps(event.get("data", {}))
-        yield f"event: {event_type}\ndata: {data_json}\n\n"
+        yield ServerSentEvent(data=data_json, event=event_type)
 
 
 @router.get("/stream")
-def event_stream():
-    return StreamingResponse(
-        _sse_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+async def event_stream():
+    return EventSourceResponse(
+        _event_generator(),
+        ping=30,
     )
