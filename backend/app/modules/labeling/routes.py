@@ -26,7 +26,7 @@ from app.modules.labeling.schemas import (
 )
 from app.modules.labeling.tasks import run_label_job
 from app.shared.database import get_db
-from app.shared.queue import labeling_queue
+from app.shared.queue import label_queue
 
 _RETRY = Retry(max=3, interval=[60, 120, 300])
 
@@ -65,7 +65,7 @@ def _enqueue_label_jobs(
         db.add(job)
         db.flush()
 
-        rq_job = labeling_queue.enqueue(run_label_job, job.id, retry=_RETRY)
+        rq_job = label_queue.enqueue(run_label_job, job.id, retry=_RETRY, at_front=True)
         job.rq_job_id = str(rq_job.id)
         db.commit()
 

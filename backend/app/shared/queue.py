@@ -16,13 +16,12 @@ ingest_queue = Queue(
     connection=redis_connection,
 )
 
-labeling_queue = Queue(
-    name="labeling",
+label_queue = Queue(
+    name="label",
     connection=redis_connection,
 )
 
-# Job2: embed chunks via bge-m3 (lower priority — workers prefer labeling_queue)
-embedding_queue = Queue(
-    name="embedding",
+embed_queue = Queue(
+    name="embed",
     connection=redis_connection,
 )
