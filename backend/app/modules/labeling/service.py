@@ -13,7 +13,7 @@ from app.modules.labeling.models import FileLabel, Label
 from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS
 from app.modules.rag.models import FileChunk
 from app.shared.config import settings
-from app.shared.events import publish_event
+from app.shared.events import publish_job_status
 
 logger = logging.getLogger(__name__)
 
@@ -452,19 +452,6 @@ def suggest_labels_augment(
 # Label job runner (unified jobs table)
 # --------------------------------------------------------------------------- #
 
-def _publish_label_event(job) -> None:
-    data: dict = {
-        "job_id": str(job.id),
-        "type": job.type,
-        "file_id": str(job.file_id),
-        "status": job.status,
-        "mode": job.mode,
-    }
-    if job.error_message:
-        data["error_message"] = job.error_message
-    publish_event("job_status", data)
-
-
 def run_label(
     db: Session,
     job_id: uuid.UUID,
@@ -487,7 +474,7 @@ def run_label(
     job.stage = "labeling"
     job.started_at = datetime.now(timezone.utc)
     db.commit()
-    _publish_label_event(job)
+    publish_job_status(job)
 
     try:
         if job.mode == "augment":
@@ -499,14 +486,14 @@ def run_label(
         job.error_message = str(exc)
         job.completed_at = datetime.now(timezone.utc)
         db.commit()
-        _publish_label_event(job)
+        publish_job_status(job)
         raise
 
     job.status = "succeeded"
     job.stage = None
     job.completed_at = datetime.now(timezone.utc)
     db.commit()
-    _publish_label_event(job)
+    publish_job_status(job)
 
     return job
 

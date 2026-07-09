@@ -8,21 +8,7 @@ from app.modules.files.models import File
 from app.modules.jobs.models import Job
 from app.modules.processing import cleaning, extraction
 from app.modules.rag import service as rag_service
-from app.shared.events import publish_event
-
-
-def _publish_ingest_event(job: Job) -> None:
-    data: dict = {
-        "job_id": str(job.id),
-        "type": job.type,
-        "file_id": str(job.file_id),
-        "status": job.status,
-    }
-    if job.stage:
-        data["stage"] = job.stage
-    if job.error_message:
-        data["error_message"] = job.error_message
-    publish_event("job_status", data)
+from app.shared.events import publish_job_status
 
 
 def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
@@ -46,7 +32,7 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
     job.started_at = datetime.now(timezone.utc)
     file.status = "processing"
     db.commit()
-    _publish_ingest_event(job)
+    publish_job_status(job)
 
     try:
         result = extraction.extract_text(Path(file.full_path), file.file_type)
@@ -56,20 +42,20 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
         job.completed_at = datetime.now(timezone.utc)
         file.status = "failed"
         db.commit()
-        _publish_ingest_event(job)
+        publish_job_status(job)
         return job, None
 
     job.stage = "clean"
     if result.ocr_applied:
         file.ocr_applied = True
     db.commit()
-    _publish_ingest_event(job)
+    publish_job_status(job)
 
     cleaned_text = cleaning.clean(result.text)
 
     job.stage = "chunk"
     db.commit()
-    _publish_ingest_event(job)
+    publish_job_status(job)
 
     rag_service.chunk_and_store(db, file.id, cleaned_text)
     db.commit()
@@ -78,7 +64,7 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
     job.completed_at = datetime.now(timezone.utc)
     file.status = "ready"
     db.commit()
-    _publish_ingest_event(job)
+    publish_job_status(job)
 
     embed_job = Job(
         type="embed",

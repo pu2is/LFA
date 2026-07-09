@@ -13,12 +13,15 @@ import json
 import logging
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from redis import Redis
 from redis.asyncio import Redis as AsyncRedis
 
 from app.shared.config import settings
+
+if TYPE_CHECKING:
+    from app.modules.jobs.models import Job
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,33 @@ def publish_event(event_type: str, data: dict[str, Any]) -> None:
         _redis.publish(CHANNEL, payload)
     except Exception:
         logger.debug("Failed to publish event (Redis may be unavailable)", exc_info=True)
+
+
+def publish_job_status(job: "Job", **extra: Any) -> None:
+    """Publish a job_status event with the payload shape shared by all job types.
+
+    Fields are included only when set on the job, so scan jobs (path_id, no
+    file_id) and file-scoped jobs (file_id, no path_id) both get a payload
+    with just the fields that apply to them. Callers can add job-specific
+    fields (e.g. file_count) via **extra.
+    """
+    data: dict[str, Any] = {
+        "job_id": str(job.id),
+        "type": job.type,
+        "status": job.status,
+    }
+    if job.path_id:
+        data["path_id"] = str(job.path_id)
+    if job.file_id:
+        data["file_id"] = str(job.file_id)
+    if job.stage:
+        data["stage"] = job.stage
+    if job.mode:
+        data["mode"] = job.mode
+    if job.error_message:
+        data["error_message"] = job.error_message
+    data.update(extra)
+    publish_event("job_status", data)
 
 
 async def async_subscribe_events() -> AsyncGenerator[dict[str, Any], None]:

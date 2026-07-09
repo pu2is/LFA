@@ -10,7 +10,7 @@ from app.modules.files.models import File
 from app.modules.jobs.models import Job
 from app.modules.rag.models import EMBEDDING_DIMENSIONS, FileChunk
 from app.shared.config import settings
-from app.shared.events import publish_event
+from app.shared.events import publish_job_status
 
 # Sized for the labeling step (#8), which only reads the first chunk or two --
 # large enough to cover a full paragraph, small enough to leave room in the
@@ -87,18 +87,6 @@ def embed_file(
         raise
 
 
-def _publish_embed_event(job: Job) -> None:
-    data: dict = {
-        "job_id": str(job.id),
-        "type": job.type,
-        "file_id": str(job.file_id),
-        "status": job.status,
-    }
-    if job.error_message:
-        data["error_message"] = job.error_message
-    publish_event("job_status", data)
-
-
 def run_embed(
     db: Session,
     job_id: uuid.UUID,
@@ -117,7 +105,7 @@ def run_embed(
     job.status = "running"
     job.started_at = datetime.now(timezone.utc)
     db.commit()
-    _publish_embed_event(job)
+    publish_job_status(job)
 
     try:
         embed_file(db, job.file_id, embeddings=embeddings)
@@ -126,12 +114,12 @@ def run_embed(
         job.error_message = str(exc)
         job.completed_at = datetime.now(timezone.utc)
         db.commit()
-        _publish_embed_event(job)
+        publish_job_status(job)
         raise
 
     job.status = "succeeded"
     job.completed_at = datetime.now(timezone.utc)
     db.commit()
-    _publish_embed_event(job)
+    publish_job_status(job)
 
     return job
