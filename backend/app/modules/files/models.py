@@ -30,7 +30,7 @@ class File(Base):
     # which requires identical-content files to be allowed to coexist.
     file_hash: Mapped[str] = mapped_column(String, index=True)
     ocr_applied: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
-    # Nullable: not all filesystems expose a creation/birth time (see er-diagram.md).
+    # Nullable: not all filesystems expose a creation/birth time (see 3_er-diagram.md).
     file_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     file_modified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String, default="discovered", server_default="discovered")

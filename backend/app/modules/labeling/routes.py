@@ -1,7 +1,6 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from rq.job import Retry
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -26,9 +25,7 @@ from app.modules.labeling.schemas import (
 )
 from app.modules.labeling.tasks import run_label_job
 from app.shared.database import get_db
-from app.shared.queue import label_queue
-
-_RETRY = Retry(max=3, interval=[60, 120, 300])
+from app.shared.queue import JOB_RETRY, label_queue
 
 
 def _require_file(db: Session, file_id: uuid.UUID) -> None:
@@ -49,7 +46,18 @@ def _enqueue_label_jobs(
     db: Session,
     files: list[File],
 ) -> LabelJobResult:
-    """Create label jobs for eligible files and enqueue them."""
+    """Create label jobs for eligible files and enqueue them.
+
+    Batch semantics: all-or-nothing. Every Job row is created (flushed for an
+    id) and handed to RQ before the single commit at the end, so a failure
+    partway through (e.g. Redis unreachable on the 3rd file) rolls back every
+    row from this call -- the caller never sees a batch that's half recorded.
+    The one gap this can't close without a distributed transaction: if RQ has
+    already accepted a job when the failure happens, that job is queued in
+    Redis even though its DB row just got rolled back. Out of scope here (see
+    #33 scope-out); acceptable because it only affects the failing request,
+    not steady-state operation.
+    """
     enqueued: list[LabelJobEnqueued] = []
     skipped: list[LabelJobSkipped] = []
 
@@ -65,12 +73,16 @@ def _enqueue_label_jobs(
         db.add(job)
         db.flush()
 
-        rq_job = label_queue.enqueue(run_label_job, job.id, retry=_RETRY, at_front=True)
+        # No at_front: cross-queue priority (label always drained before
+        # ingest/scan/embed) is enforced by worker queue listen order, see
+        # docs/dev-setup.md. at_front only reordered *within* this queue,
+        # which broke submission order for no priority benefit -- see #33.
+        rq_job = label_queue.enqueue(run_label_job, job.id, retry=JOB_RETRY)
         job.rq_job_id = str(rq_job.id)
-        db.commit()
 
         enqueued.append(LabelJobEnqueued(job_id=job.id, file_id=file.id, mode=mode))
 
+    db.commit()
     return LabelJobResult(enqueued=enqueued, skipped=skipped)
 
 

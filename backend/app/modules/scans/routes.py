@@ -21,7 +21,9 @@ def create_scan(payload: ScanCreate, db: Session = Depends(get_db)) -> Job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
 
     scan = service.create_scan(db, payload.path_id)
-    scan_queue.enqueue(run_scan_job, scan.id)
+    rq_job = scan_queue.enqueue(run_scan_job, scan.id)
+    scan.rq_job_id = str(rq_job.id)
+    db.commit()
     return scan
 
 
