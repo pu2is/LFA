@@ -1,4 +1,5 @@
-"""Tests for initial-mode _write_initial_candidates and augment-mode _append_augment_candidates.
+"""Tests for initial-mode write_initial_candidates and augment-mode append_augment_candidates
+(app.modules.labeling.merge), exercised through suggest_labels / suggest_labels_augment.
 
 Initial mode: pure INSERT (no existing rows expected).
 Augment mode: append-only — confirmed/rejected/suggested NEVER touched;
@@ -11,16 +12,15 @@ from sqlalchemy import delete, select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.labeling.models import FileLabel, Label
-from app.modules.labeling.service import (
+from app.modules.labeling.prompts import (
     AugmentCandidate,
     AugmentSuggestionOutput,
     CatalogCandidate,
     FreetextCandidate,
     LabelSuggestionOutput,
-    normalize_label_name,
-    suggest_labels,
-    suggest_labels_augment,
 )
+from app.modules.labeling.service import normalize_label_name
+from app.modules.labeling.suggestion import suggest_labels, suggest_labels_augment
 from app.modules.rag.models import FileChunk
 
 
@@ -55,7 +55,7 @@ def _mock_augment_llm(names: list[str]) -> MagicMock:
 
 
 # --------------------------------------------------------------------------- #
-# Initial mode: _write_initial_candidates
+# Initial mode: write_initial_candidates
 # --------------------------------------------------------------------------- #
 
 def test_initial_inserts_catalog_and_freetext(db):
@@ -145,7 +145,7 @@ def test_normalize_label_name_replaces_spaces_with_underscores():
 
 
 # --------------------------------------------------------------------------- #
-# Augment mode: _append_augment_candidates — append-only semantics
+# Augment mode: append_augment_candidates — append-only semantics
 # --------------------------------------------------------------------------- #
 
 def test_augment_appends_new_label(db):

@@ -11,12 +11,12 @@ from sqlalchemy import delete, select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.labeling.models import FileLabel, Label
-from app.modules.labeling.service import (
+from app.modules.labeling.prompts import (
     CatalogCandidate,
     FreetextCandidate,
     LabelSuggestionOutput,
-    suggest_labels,
 )
+from app.modules.labeling.suggestion import suggest_labels
 from app.modules.rag.models import FileChunk
 
 
@@ -88,7 +88,7 @@ def _mock_llm(
 
 def test_suggest_labels_stores_catalog_picks(db, seeded_db):
     file, _ = seeded_db
-    # CONFIDENCE_THRESHOLD_DROP = 0.0 → both are stored (all non-negative confidences pass)
+    # No server-side confidence filtering -- both are stored regardless of confidence
     llm = _mock_llm(catalog=[("invoice", 0.9), ("contract", 0.3)])
 
     result = suggest_labels(db, file.id, llm=llm)
@@ -101,7 +101,7 @@ def test_suggest_labels_stores_catalog_picks(db, seeded_db):
 
 def test_suggest_labels_stores_medium_confidence_label(db, seeded_db):
     file, _ = seeded_db
-    # 0.6 is between DROP (0.0) and HIGH (0.75) → stored as "suggested"
+    # Below HIGH (0.75) → still stored, just not UI-preselected
     llm = _mock_llm(catalog=[("report", 0.6)])
 
     result = suggest_labels(db, file.id, llm=llm)
