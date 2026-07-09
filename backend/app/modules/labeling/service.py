@@ -2,11 +2,10 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-import httpx
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -35,14 +34,41 @@ def normalize_label_name(raw: str) -> str:
 # LLM output schema
 # --------------------------------------------------------------------------- #
 
+def _coerce_confidence(v: object) -> object:
+    """Normalize an LLM-provided confidence to the 0.0–1.0 range.
+
+    Small local models (e.g. qwen2.5:3b) ignore the 0–1 instruction and often
+    return a 0–100 percentage. Without this, pydantic's le=1.0 check fails the
+    WHOLE structured-output parse, suggest_labels swallows it, and the label job
+    silently produces zero labels. Divide >1 values by 100 and clamp to [0, 1].
+    """
+    try:
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return v  # let pydantic raise its normal validation error
+    if f > 1.0:
+        f = f / 100.0
+    return min(max(f, 0.0), 1.0)
+
+
 class CatalogCandidate(BaseModel):
     name: str = Field(description="Label name exactly as it appears in the available labels list")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0.0–1.0")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: object) -> object:
+        return _coerce_confidence(v)
 
 
 class FreetextCandidate(BaseModel):
     name: str = Field(description="A specific label name you invented; use lowercase_with_underscores")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0.0–1.0")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: object) -> object:
+        return _coerce_confidence(v)
 
 
 class LabelSuggestionOutput(BaseModel):
@@ -222,9 +248,11 @@ def suggest_labels(
 
     The LLM client is injectable so tests can pass a mock without hitting Ollama.
 
-    Error handling:
-    - httpx connection/timeout → re-raised (caller marks job failed, RQ retries)
-    - All other errors → logged, returns [] (chunks are still valuable)
+    Error handling (fail-loud):
+    - Any LLM/parse error → logged and re-raised. run_label marks the job failed
+      and records error_message; RQ retries transient failures (e.g. Ollama down).
+      We do NOT swallow: a label job that produced nothing must look failed, not
+      succeeded. Labeling is its own job, so failing it never undoes ingest/embed.
     """
     labels = _ensure_label_catalog(db)
 
@@ -256,11 +284,10 @@ def suggest_labels(
 
     try:
         output: LabelSuggestionOutput = structured_llm.invoke(messages)
-    except (httpx.ConnectError, httpx.TimeoutException):
-        raise
     except Exception as exc:
-        logger.warning("suggest_labels: non-fatal LLM error for file %s: %s", file_id, exc)
-        return []
+        # Fail loud — see "Error handling" in the docstring.
+        logger.warning("suggest_labels: LLM error for file %s: %s", file_id, exc)
+        raise
 
     file_labels = _write_initial_candidates(db, file_id, output, labels)
 
@@ -406,11 +433,10 @@ def suggest_labels_augment(
 
     try:
         output: AugmentSuggestionOutput = structured_llm.invoke(messages)
-    except (httpx.ConnectError, httpx.TimeoutException):
-        raise
     except Exception as exc:
-        logger.warning("suggest_labels_augment: non-fatal LLM error for file %s: %s", file_id, exc)
-        return []
+        # Fail loud — a label job that produced nothing must look failed.
+        logger.warning("suggest_labels_augment: LLM error for file %s: %s", file_id, exc)
+        raise
 
     file_labels = _append_augment_candidates(db, file_id, output, labels)
 

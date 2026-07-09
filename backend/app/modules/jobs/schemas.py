@@ -22,3 +22,13 @@ class JobRead(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+
+
+class JobListRead(JobRead):
+    """JobRead plus a human-readable target (filename, or path for scans).
+
+    Used by the processing-table snapshot so the UI can show what each job is
+    working on without a second round-trip per job.
+    """
+
+    target_name: str | None = None
