@@ -8,7 +8,7 @@ from app.modules.jobs.routes import router as jobs_router
 from app.modules.labeling.routes import router as labels_router
 from app.modules.scans.routes import router as scans_router
 from app.shared.config import settings
-from app.shared.database import Base, engine, get_db
+from app.shared.database import Base, get_db
 
 app = FastAPI(title=settings.app_name)
 

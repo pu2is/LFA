@@ -59,13 +59,13 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
         _publish_ingest_event(job)
         return job, None
 
-    cleaned_text = cleaning.clean(result.text)
-
     job.stage = "clean"
     if result.ocr_applied:
         file.ocr_applied = True
     db.commit()
     _publish_ingest_event(job)
+
+    cleaned_text = cleaning.clean(result.text)
 
     job.stage = "chunk"
     db.commit()
@@ -84,7 +84,7 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
         type="embed",
         file_id=file.id,
         parent_job_id=job.id,
-        trigger="scan",
+        trigger=job.trigger,
     )
     db.add(embed_job)
     db.commit()
