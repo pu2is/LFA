@@ -1,11 +1,17 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
+
+# Job types surfaced in the files list as "processing status": ingest and
+# label are the two file-level pipeline steps with no other visibility (embed
+# has its own files.embedding_status column; scan is path-level -- Job.file_id
+# is NULL for scans, see ck_jobs_target -- so it can't join to a file anyway).
+_FILE_STATUS_JOB_TYPES = ("ingest", "label")
 
 
 def get_path_by_value(db: Session, path: str) -> RegisteredPath | None:
@@ -37,28 +43,30 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
     return db.scalar(select(File).where(File.full_path == full_path))
 
 
-def list_files(db: Session, path_id: uuid.UUID | None = None) -> list[tuple[File, str | None, str | None]]:
-    latest_job_status = (
-        select(Job.status)
-        .where(Job.file_id == File.id, Job.type == "ingest")
+def list_files(
+    db: Session, path_id: uuid.UUID | None = None
+) -> list[tuple[File, str | None, str | None, str | None]]:
+    """List files, each joined with its most recent ingest-or-label job.
+
+    One LATERAL join per file (not one scalar subquery per projected column)
+    so Postgres runs the "latest job" lookup once and reuses the
+    ix_jobs_file_type_created index, instead of evaluating the same
+    correlated subquery twice (once for status, once for error_message).
+    """
+    latest_job = (
+        select(Job.status, Job.error_message, Job.type)
+        .where(Job.file_id == File.id, Job.type.in_(_FILE_STATUS_JOB_TYPES))
         .order_by(Job.created_at.desc())
         .limit(1)
         .correlate(File)
-        .scalar_subquery()
-    )
-    latest_job_error = (
-        select(Job.error_message)
-        .where(Job.file_id == File.id, Job.type == "ingest")
-        .order_by(Job.created_at.desc())
-        .limit(1)
-        .correlate(File)
-        .scalar_subquery()
+        .lateral("latest_job")
     )
     stmt = select(
         File,
-        latest_job_status.label("processing_job_status"),
-        latest_job_error.label("processing_error_message"),
-    )
+        latest_job.c.status.label("processing_job_status"),
+        latest_job.c.error_message.label("processing_error_message"),
+        latest_job.c.type.label("processing_job_type"),
+    ).outerjoin(latest_job, true())
     if path_id is not None:
         stmt = stmt.where(File.path_id == path_id)
     return list(db.execute(stmt))
@@ -87,7 +95,7 @@ def upsert_file(
     Matched by `full_path` (unique). Deliberately leaves `status` and
     `ocr_applied` untouched on existing rows: those reflect later pipeline
     stages (OCR, labeling) that a scan must not silently reset, even if the
-    file's content changed (see er-diagram.md "modified" handling).
+    file's content changed (see 3_er-diagram.md "modified" handling).
     """
     file = get_file_by_full_path(db, full_path)
     if file is not None:

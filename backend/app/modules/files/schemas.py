@@ -43,5 +43,6 @@ class FileRead(BaseModel):
     embedding_status: str
     processing_job_status: str | None = None
     processing_error_message: str | None = None
+    processing_job_type: str | None = None
     created_at: datetime
     updated_at: datetime

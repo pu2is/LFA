@@ -9,25 +9,7 @@ from app.modules.files import service as files_service
 from app.modules.files.models import File
 from app.modules.jobs.models import Job
 from app.modules.scans import discovery
-from app.shared.events import publish_event
-
-
-def _publish_job_event(job: Job, **extra) -> None:
-    data: dict = {
-        "job_id": str(job.id),
-        "type": job.type,
-        "status": job.status,
-    }
-    if job.path_id:
-        data["path_id"] = str(job.path_id)
-    if job.file_id:
-        data["file_id"] = str(job.file_id)
-    if job.stage:
-        data["stage"] = job.stage
-    if job.error_message:
-        data["error_message"] = job.error_message
-    data.update(extra)
-    publish_event("job_status", data)
+from app.shared.events import publish_job_status
 
 
 def create_scan(db: Session, path_id: uuid.UUID) -> Job:
@@ -62,7 +44,7 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
     scan_job.status = "running"
     scan_job.started_at = datetime.now(timezone.utc)
     db.commit()
-    _publish_job_event(scan_job)
+    publish_job_status(scan_job)
 
     try:
         for doc in discovery.iter_documents(Path(registered_path.path)):
@@ -82,7 +64,7 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
         scan_job.error_message = str(exc)
         scan_job.completed_at = datetime.now(timezone.utc)
         db.commit()
-        _publish_job_event(scan_job)
+        publish_job_status(scan_job)
         return scan_job, []
 
     file_count = files_service.count_files_by_path(db, scan_job.path_id)
@@ -90,7 +72,7 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
     scan_job.completed_at = datetime.now(timezone.utc)
     registered_path.last_scanned_at = scan_job.completed_at
     db.commit()
-    _publish_job_event(scan_job, file_count=file_count)
+    publish_job_status(scan_job, file_count=file_count)
 
     # Fan-out: create one ingest job per discovered file under this path.
     discovered_files = list(db.scalars(

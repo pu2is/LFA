@@ -13,9 +13,13 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.shared.database import Base
+
+# Per-type job variant (see docs/03_er-diagram.md). Not a DB CHECK constraint
+# on purpose -- adding a new mode is a one-line change here, not a migration.
+VALID_JOB_MODES = frozenset({"default", "initial", "augment", "check"})
 
 
 class Job(Base):
@@ -63,3 +67,9 @@ class Job(Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    @validates("mode")
+    def _validate_mode(self, _key: str, value: str) -> str:
+        if value not in VALID_JOB_MODES:
+            raise ValueError(f"Invalid job mode {value!r}; expected one of {sorted(VALID_JOB_MODES)}")
+        return value

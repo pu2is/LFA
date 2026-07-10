@@ -43,6 +43,7 @@ def list_files(path_id: uuid.UUID | None = None, db: Session = Depends(get_db)) 
         FileRead.model_validate(file).model_copy(update={
             "processing_job_status": job_status,
             "processing_error_message": error_msg,
+            "processing_job_type": job_type,
         })
-        for file, job_status, error_msg in rows
+        for file, job_status, error_msg, job_type in rows
     ]
