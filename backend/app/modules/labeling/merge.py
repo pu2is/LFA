@@ -42,7 +42,6 @@ def write_initial_candidates(
             label_name=lbl.name,
             source="llm",
             status="suggested",
-            confidence=candidate.confidence,
         )
         db.add(fl)
         file_labels.append(fl)
@@ -64,7 +63,6 @@ def write_initial_candidates(
             label_name=normalized,
             source="llm",
             status="suggested",
-            confidence=candidate.confidence,
         )
         db.add(fl)
         file_labels.append(fl)
@@ -104,7 +102,6 @@ def append_augment_candidates(
             label_name=lbl.name if lbl else normalized,
             source="llm",
             status="suggested",
-            confidence=None,
         )
         db.add(fl)
         file_labels.append(fl)

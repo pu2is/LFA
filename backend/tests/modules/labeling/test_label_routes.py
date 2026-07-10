@@ -104,7 +104,6 @@ def ready_file_with_labels(db: Session):
         label_name=lbl.name,
         source="llm",
         status="confirmed",
-        confidence=0.9,
     )
     db.add(fl)
     db.commit()

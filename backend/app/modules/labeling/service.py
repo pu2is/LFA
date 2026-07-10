@@ -109,7 +109,6 @@ def add_user_label(db: Session, file_id: uuid.UUID, label: Label) -> FileLabel:
         label_name=label.name,
         source="user",
         status="confirmed",
-        confidence=None,
     )
     db.add(fl)
     db.commit()

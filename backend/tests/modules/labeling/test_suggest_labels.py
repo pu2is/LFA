@@ -67,13 +67,13 @@ def seeded_db(db):
 
 
 def _mock_llm(
-    catalog: list[tuple[str, float]] | None = None,
-    freetext: list[tuple[str, float]] | None = None,
+    catalog: list[str] | None = None,
+    freetext: list[str] | None = None,
 ) -> MagicMock:
     """Build a mock BaseChatModel whose structured-output chain returns the given picks."""
     output = LabelSuggestionOutput(
-        catalog_picks=[CatalogCandidate(name=n, confidence=c) for n, c in (catalog or [])],
-        free_suggestions=[FreetextCandidate(name=n, confidence=c) for n, c in (freetext or [])],
+        catalog_picks=[CatalogCandidate(name=n) for n in (catalog or [])],
+        free_suggestions=[FreetextCandidate(name=n) for n in (freetext or [])],
     )
     mock_chain = MagicMock()
     mock_chain.invoke.return_value = output
@@ -88,8 +88,7 @@ def _mock_llm(
 
 def test_suggest_labels_stores_catalog_picks(db, seeded_db):
     file, _ = seeded_db
-    # No server-side confidence filtering -- both are stored regardless of confidence
-    llm = _mock_llm(catalog=[("invoice", 0.9), ("contract", 0.3)])
+    llm = _mock_llm(catalog=["invoice", "contract"])
 
     result = suggest_labels(db, file.id, llm=llm)
 
@@ -99,21 +98,10 @@ def test_suggest_labels_stores_catalog_picks(db, seeded_db):
     assert all(fl.label_id is not None for fl in result)
 
 
-def test_suggest_labels_stores_medium_confidence_label(db, seeded_db):
-    file, _ = seeded_db
-    # Below HIGH (0.75) → still stored, just not UI-preselected
-    llm = _mock_llm(catalog=[("report", 0.6)])
-
-    result = suggest_labels(db, file.id, llm=llm)
-
-    assert len(result) == 1
-    assert result[0].confidence == 0.6
-
-
 def test_suggest_labels_stores_freetext_suggestions(db, seeded_db):
     """LLM-invented labels (not in catalog) are stored with label_id=None."""
     file, _ = seeded_db
-    llm = _mock_llm(catalog=[("invoice", 0.9)], freetext=[("car_rental_agreement", 0.8)])
+    llm = _mock_llm(catalog=["invoice"], freetext=["car_rental_agreement"])
 
     result = suggest_labels(db, file.id, llm=llm)
 
@@ -128,7 +116,7 @@ def test_suggest_labels_drops_unknown_catalog_names(db, seeded_db):
     """catalog_picks whose names are not in the label table are silently dropped."""
     file, _ = seeded_db
     # "receipt" is not in the label catalog → dropped from catalog_picks path
-    llm = _mock_llm(catalog=[("invoice", 0.9), ("receipt", 0.85)])
+    llm = _mock_llm(catalog=["invoice", "receipt"])
 
     result = suggest_labels(db, file.id, llm=llm)
 
@@ -139,7 +127,7 @@ def test_suggest_labels_drops_unknown_catalog_names(db, seeded_db):
 def test_suggest_labels_deduplicates_repeated_label(db, seeded_db):
     file, _ = seeded_db
     # LLM returns the same catalog label twice → only one row inserted
-    llm = _mock_llm(catalog=[("invoice", 0.9), ("invoice", 0.75)])
+    llm = _mock_llm(catalog=["invoice", "invoice"])
 
     result = suggest_labels(db, file.id, llm=llm)
 
@@ -149,7 +137,7 @@ def test_suggest_labels_deduplicates_repeated_label(db, seeded_db):
 def test_suggest_labels_case_insensitive_name_match(db, seeded_db):
     file, _ = seeded_db
     # Labels are stored lowercase; LLM might return "Invoice"
-    llm = _mock_llm(catalog=[("Invoice", 0.85)])
+    llm = _mock_llm(catalog=["Invoice"])
 
     result = suggest_labels(db, file.id, llm=llm)
 
@@ -160,7 +148,7 @@ def test_suggest_labels_freetext_skipped_if_matches_catalog_name(db, seeded_db):
     """A free_suggestion whose name matches an existing catalog label is dropped."""
     file, _ = seeded_db
     # "invoice" exists as a catalog label → free-text path skips it (avoid duplication)
-    llm = _mock_llm(freetext=[("invoice", 0.95)])
+    llm = _mock_llm(freetext=["invoice"])
 
     result = suggest_labels(db, file.id, llm=llm)
 

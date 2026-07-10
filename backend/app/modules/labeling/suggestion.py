@@ -20,16 +20,6 @@ from app.shared.config import settings
 
 logger = logging.getLogger(__name__)
 
-# UI hint only, not enforced here: the frontend pre-selects a label when its
-# confidence is >= this value; everything else is still stored as
-# "suggested" for the user to review. There is no server-side drop
-# threshold -- every suggestion the LLM returns gets stored (the model is
-# asked to only return confidence >= 0.25 in the prompt itself, but nothing
-# here re-checks that on the way in; a prior CONFIDENCE_THRESHOLD_DROP = 0.0
-# constant implied a stricter contract than actually existed and was removed
-# as dead code, see #34).
-CONFIDENCE_THRESHOLD_HIGH = 0.75
-
 
 def _ensure_label_catalog(db: Session) -> list[Label]:
     """Return all labels in the catalog; auto-populate from presets if empty."""
@@ -45,6 +35,20 @@ def _ensure_label_catalog(db: Session) -> list[Label]:
     for lbl in new_labels:
         db.refresh(lbl)
     return new_labels
+
+
+def _invoke_or_raise(structured_llm, messages, *, log_prefix: str, file_id: uuid.UUID):
+    """Fail loud: log then re-raise any LLM/parse error, never swallow it.
+
+    run_label marks the job failed and records error_message on this
+    exception; RQ retries transient failures. A label job that produced
+    nothing must look failed, not succeeded.
+    """
+    try:
+        return structured_llm.invoke(messages)
+    except Exception as exc:
+        logger.warning("%s: LLM error for file %s: %s", log_prefix, file_id, exc)
+        raise
 
 
 def _load_chunks_and_llm(
@@ -98,9 +102,9 @@ def suggest_labels(
 
     If the label catalog is empty, all presets are auto-inserted before calling the LLM.
 
-    No confidence-based filtering happens server-side — every suggestion the
-    LLM returns is stored as "suggested". Labels >= CONFIDENCE_THRESHOLD_HIGH
-    (0.75) are a UI hint for pre-selecting; the rest still show up for review.
+    No confidence scoring happens anywhere in this pipeline (see ADR-0001 D2) --
+    every suggestion the LLM returns is stored as "suggested"; quality control
+    is entirely the user's confirm/reject action, not a model-reported score.
 
     The LLM client is injectable so tests can pass a mock without hitting Ollama.
 
@@ -121,12 +125,9 @@ def suggest_labels(
         text="\n\n".join(c.content for c in chunks),
     )
 
-    try:
-        output: LabelSuggestionOutput = structured_llm.invoke(messages)
-    except Exception as exc:
-        # Fail loud — see "Error handling" in the docstring.
-        logger.warning("suggest_labels: LLM error for file %s: %s", file_id, exc)
-        raise
+    output: LabelSuggestionOutput = _invoke_or_raise(
+        structured_llm, messages, log_prefix="suggest_labels", file_id=file_id
+    )
 
     file_labels = write_initial_candidates(db, file_id, output, labels)
 
@@ -167,12 +168,9 @@ def suggest_labels_augment(
         text="\n\n".join(c.content for c in chunks),
     )
 
-    try:
-        output: AugmentSuggestionOutput = structured_llm.invoke(messages)
-    except Exception as exc:
-        # Fail loud — a label job that produced nothing must look failed.
-        logger.warning("suggest_labels_augment: LLM error for file %s: %s", file_id, exc)
-        raise
+    output: AugmentSuggestionOutput = _invoke_or_raise(
+        structured_llm, messages, log_prefix="suggest_labels_augment", file_id=file_id
+    )
 
     file_labels = append_augment_candidates(db, file_id, output, labels)
 

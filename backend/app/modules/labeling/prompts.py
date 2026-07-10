@@ -1,43 +1,14 @@
 """LLM output schemas and prompt templates for label suggestion (initial + augment)."""
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field, field_validator
-
-
-def _coerce_confidence(v: object) -> object:
-    """Normalize an LLM-provided confidence to the 0.0–1.0 range.
-
-    Small local models (e.g. qwen2.5:3b) ignore the 0–1 instruction and often
-    return a 0–100 percentage. Without this, pydantic's le=1.0 check fails the
-    WHOLE structured-output parse, suggest_labels swallows it, and the label job
-    silently produces zero labels. Divide >1 values by 100 and clamp to [0, 1].
-    """
-    try:
-        f = float(v)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return v  # let pydantic raise its normal validation error
-    if f > 1.0:
-        f = f / 100.0
-    return min(max(f, 0.0), 1.0)
+from pydantic import BaseModel, Field
 
 
 class CatalogCandidate(BaseModel):
     name: str = Field(description="Label name exactly as it appears in the available labels list")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0.0–1.0")
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _normalize_confidence(cls, v: object) -> object:
-        return _coerce_confidence(v)
 
 
 class FreetextCandidate(BaseModel):
     name: str = Field(description="A specific label name you invented; use lowercase_with_underscores")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0.0–1.0")
-
-    @field_validator("confidence", mode="before")
-    @classmethod
-    def _normalize_confidence(cls, v: object) -> object:
-        return _coerce_confidence(v)
 
 
 class LabelSuggestionOutput(BaseModel):
@@ -66,8 +37,7 @@ INITIAL_SUGGESTION_PROMPT = ChatPromptTemplate.from_messages(
             "2. Suggest additional fine-grained labels NOT in the list "
             "if they describe the document more specifically (e.g. 'car_rental_agreement' "
             "instead of just 'contract'). Use lowercase_with_underscores.\n\n"
-            "For every label (catalog or invented) assign a confidence score 0.0–1.0. "
-            "Include all labels with confidence >= 0.25. Be generous — more labels help the user.",
+            "Be generous — more labels help the user; they will confirm or reject each one.",
         ),
         (
             "human",

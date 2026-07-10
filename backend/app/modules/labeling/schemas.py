@@ -77,7 +77,6 @@ class FileLabelRead(BaseModel):
     label_name: str             # always set; copied from labels.name for catalog picks
     source: str
     status: str
-    confidence: float | None
     created_at: datetime
     updated_at: datetime
 

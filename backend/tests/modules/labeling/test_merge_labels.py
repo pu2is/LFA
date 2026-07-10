@@ -29,12 +29,12 @@ from app.modules.rag.models import FileChunk
 # --------------------------------------------------------------------------- #
 
 def _mock_llm(
-    catalog: list[tuple[str, float]] | None = None,
-    freetext: list[tuple[str, float]] | None = None,
+    catalog: list[str] | None = None,
+    freetext: list[str] | None = None,
 ) -> MagicMock:
     output = LabelSuggestionOutput(
-        catalog_picks=[CatalogCandidate(name=n, confidence=c) for n, c in (catalog or [])],
-        free_suggestions=[FreetextCandidate(name=n, confidence=c) for n, c in (freetext or [])],
+        catalog_picks=[CatalogCandidate(name=n) for n in (catalog or [])],
+        free_suggestions=[FreetextCandidate(name=n) for n in (freetext or [])],
     )
     mock_chain = MagicMock()
     mock_chain.invoke.return_value = output
@@ -80,7 +80,7 @@ def test_initial_inserts_catalog_and_freetext(db):
     db.commit()
 
     try:
-        llm = _mock_llm(catalog=[(label_name, 0.9)], freetext=[("wrt_t1_custom", 0.7)])
+        llm = _mock_llm(catalog=[label_name], freetext=["wrt_t1_custom"])
         result = suggest_labels(db, f.id, llm=llm)
 
         catalog_picks = [fl for fl in result if fl.label_id is not None]
@@ -120,7 +120,7 @@ def test_initial_deduplicates_repeated_catalog_pick(db):
     db.commit()
 
     try:
-        llm = _mock_llm(catalog=[(label_name, 0.9), (label_name, 0.5)])
+        llm = _mock_llm(catalog=[label_name, label_name])
         result = suggest_labels(db, f.id, llm=llm)
         assert len(result) == 1
     finally:
@@ -172,7 +172,7 @@ def test_augment_appends_new_label(db):
 
     existing_fl = FileLabel(
         file_id=f.id, label_id=lbl.id, label_name=catalog_name,
-        source="llm", status="confirmed", confidence=0.9,
+        source="llm", status="confirmed",
     )
     db.add(existing_fl)
     db.commit()
@@ -183,7 +183,6 @@ def test_augment_appends_new_label(db):
 
         assert len(result) == 1
         assert result[0].label_name == "aug_t1_new_angle"
-        assert result[0].confidence is None
         assert result[0].source == "llm"
         assert result[0].status == "suggested"
     finally:
@@ -219,7 +218,7 @@ def test_augment_skips_existing_names(db):
 
     existing_fl = FileLabel(
         file_id=f.id, label_id=lbl.id, label_name=catalog_name,
-        source="llm", status="confirmed", confidence=0.9,
+        source="llm", status="confirmed",
     )
     db.add(existing_fl)
     db.commit()
@@ -265,7 +264,7 @@ def test_augment_rejected_stays_rejected(db):
 
     rejected_fl = FileLabel(
         file_id=f.id, label_id=None, label_name=rejected_name,
-        source="llm", status="rejected", confidence=0.6,
+        source="llm", status="rejected",
     )
     db.add(rejected_fl)
     db.commit()
@@ -312,7 +311,7 @@ def test_augment_confirmed_stays_confirmed(db):
 
     confirmed_fl = FileLabel(
         file_id=f.id, label_id=lbl.id, label_name=catalog_name,
-        source="llm", status="confirmed", confidence=0.9,
+        source="llm", status="confirmed",
     )
     db.add(confirmed_fl)
     db.commit()
@@ -326,7 +325,6 @@ def test_augment_confirmed_stays_confirmed(db):
 
         db.refresh(confirmed_fl)
         assert confirmed_fl.status == "confirmed"
-        assert confirmed_fl.confidence == 0.9
     finally:
         db.execute(delete(FileLabel).where(FileLabel.file_id == f.id))
         db.execute(delete(FileChunk).where(FileChunk.file_id == f.id))
@@ -362,7 +360,7 @@ def test_augment_catalog_match_sets_label_id(db):
 
     existing_fl = FileLabel(
         file_id=f.id, label_id=lbl_old.id, label_name=existing_name,
-        source="llm", status="suggested", confidence=0.5,
+        source="llm", status="suggested",
     )
     db.add(existing_fl)
     db.commit()
