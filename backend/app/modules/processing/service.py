@@ -29,6 +29,7 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
 
     job.status = "running"
     job.stage = "extract"
+    job.error_message = None  # clear any stale error from a prior failed attempt (#33 retry)
     job.started_at = datetime.now(timezone.utc)
     file.status = "processing"
     db.commit()

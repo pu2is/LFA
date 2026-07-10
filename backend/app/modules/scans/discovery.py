@@ -73,7 +73,7 @@ def _creation_time(stat: os.stat_result) -> datetime | None:
 
     st_birthtime is available on Windows (Python 3.12+) and macOS, but many
     Linux filesystems don't track a birth time at all -- fall back to None
-    per the cross-platform note in docs/3_er-diagram.md.
+    per the cross-platform note in docs/03_er-diagram.md.
     """
     try:
         return datetime.fromtimestamp(stat.st_birthtime, tz=timezone.utc)

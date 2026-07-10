@@ -75,7 +75,7 @@ def _enqueue_label_jobs(
 
         # No at_front: cross-queue priority (label always drained before
         # ingest/scan/embed) is enforced by worker queue listen order, see
-        # docs/dev-setup.md. at_front only reordered *within* this queue,
+        # docs/99_dev-setup.md. at_front only reordered *within* this queue,
         # which broke submission order for no priority benefit -- see #33.
         rq_job = label_queue.enqueue(run_label_job, job.id, retry=JOB_RETRY)
         job.rq_job_id = str(rq_job.id)

@@ -28,6 +28,7 @@ def run_label(
 
     job.status = "running"
     job.stage = "labeling"
+    job.error_message = None  # clear any stale error from a prior failed attempt (#33 retry)
     job.started_at = datetime.now(timezone.utc)
     db.commit()
     publish_job_status(job)

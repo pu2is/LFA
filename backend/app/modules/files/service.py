@@ -95,7 +95,7 @@ def upsert_file(
     Matched by `full_path` (unique). Deliberately leaves `status` and
     `ocr_applied` untouched on existing rows: those reflect later pipeline
     stages (OCR, labeling) that a scan must not silently reset, even if the
-    file's content changed (see 3_er-diagram.md "modified" handling).
+    file's content changed (see 03_er-diagram.md "modified" handling).
     """
     file = get_file_by_full_path(db, full_path)
     if file is not None:

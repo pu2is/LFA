@@ -8,7 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.shared.database import Base
 
-# Must match the bge-m3 embedding model's output size (see docs/3_er-diagram.md).
+# Must match the bge-m3 embedding model's output size (see docs/03_er-diagram.md).
 # Switching embedding models means re-embedding every chunk + an Alembic migration.
 EMBEDDING_DIMENSIONS = 1024
 
