@@ -1,47 +1,17 @@
 """run_ingest's job-lifecycle bookkeeping (extraction/cleaning/chunking
 themselves are covered in their own module tests)."""
-from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 
-from app.modules.files.models import File, RegisteredPath
-from app.modules.jobs.models import Job
 from app.modules.processing.extraction import ExtractionResult
 from app.modules.processing.service import run_ingest
+from tests.factories import make_failed_job
 
 
 @pytest.fixture
 def ingest_job(db):
-    path = RegisteredPath(path="/processing-run-ingest-fixture")
-    db.add(path)
-    db.flush()
-
-    file = File(
-        path_id=path.id,
-        filename="sample.pdf",
-        full_path="/processing-run-ingest-fixture/sample.pdf",
-        file_type="pdf",
-        file_size=1000,
-        file_hash="c" * 64,
-        file_modified_at=datetime.now(timezone.utc),
-        status="processing",
-    )
-    db.add(file)
-    db.flush()
-
-    job = Job(
-        type="ingest",
-        file_id=file.id,
-        trigger="scan",
-        # Simulates a prior failed attempt that RQ is now retrying (#33).
-        status="failed",
-        error_message="file was locked",
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    yield job
+    return make_failed_job(db, job_type="ingest", file_status="processing", error_message="file was locked")
 
 
 @patch("app.modules.processing.service.extraction.extract_text")
