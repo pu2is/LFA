@@ -41,11 +41,23 @@ def is_supported_document(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
-def iter_documents(root: Path) -> Iterator[DiscoveredFile]:
-    """Recursively yield every supported document under `root`."""
-    for path in root.rglob("*"):
-        if path.is_file() and is_supported_document(path):
-            yield _describe(path)
+def iter_documents(
+    root: Path, exclude_roots: frozenset[Path] = frozenset()
+) -> Iterator[DiscoveredFile]:
+    """Recursively yield every supported document under `root`.
+
+    `exclude_roots` are already-registered child paths (see
+    files/service.get_child_paths): pruned in-place from `dirnames` before
+    Path.walk() descends into them, so files under a registered child
+    subtree get zero stat/zero hash -- not merely zero upsert (see
+    docs/workflow/01a-path-scan.md).
+    """
+    for dirpath, dirnames, filenames in root.walk():
+        dirnames[:] = [name for name in dirnames if dirpath / name not in exclude_roots]
+        for filename in filenames:
+            path = dirpath / filename
+            if path.is_file() and is_supported_document(path):
+                yield _describe(path)
 
 
 def compute_sha256(path: Path) -> str:

@@ -46,8 +46,11 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
     db.commit()
     publish_job_status(scan_job)
 
+    child_paths = files_service.get_child_paths(db, registered_path.id)
+    exclude_roots = frozenset(Path(child.path) for child in child_paths)
+
     try:
-        for doc in discovery.iter_documents(Path(registered_path.path)):
+        for doc in discovery.iter_documents(Path(registered_path.path), exclude_roots=exclude_roots):
             files_service.upsert_file(
                 db,
                 path_id=registered_path.id,

@@ -27,6 +27,14 @@ def list_paths(db: Session) -> list[RegisteredPath]:
     return list(db.scalars(select(RegisteredPath)))
 
 
+def get_child_paths(db: Session, parent_id: uuid.UUID) -> list[RegisteredPath]:
+    """Direct registered children of `parent_id` (one level -- sufficient for
+    scan-time pruning: any deeper registered descendant lies inside one of
+    these children's subtree, see docs/workflow/00a-path-register.md).
+    """
+    return list(db.scalars(select(RegisteredPath).where(RegisteredPath.parent_path_id == parent_id)))
+
+
 def find_ancestor_conflict(db: Session, resolved_path: str) -> RegisteredPath | None:
     """Return an existing registered path that `resolved_path` is nested under, if any.
 
