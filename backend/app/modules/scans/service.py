@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.modules.files import service as files_service
 from app.modules.files.models import File
 from app.modules.jobs.models import Job
+from app.modules.jobs.service import mark_failed, mark_running
 from app.modules.scans import discovery
 from app.shared.events import publish_job_status
 
@@ -41,10 +42,7 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
     if registered_path is None:
         raise ValueError(f"Registered path {scan_job.path_id} not found")
 
-    scan_job.status = "running"
-    scan_job.started_at = datetime.now(timezone.utc)
-    db.commit()
-    publish_job_status(scan_job)
+    mark_running(db, scan_job)
 
     try:
         for doc in discovery.iter_documents(Path(registered_path.path)):
@@ -60,11 +58,7 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
                 file_modified_at=doc.file_modified_at,
             )
     except OSError as exc:
-        scan_job.status = "failed"
-        scan_job.error_message = str(exc)
-        scan_job.completed_at = datetime.now(timezone.utc)
-        db.commit()
-        publish_job_status(scan_job)
+        mark_failed(db, scan_job, exc)
         return scan_job, []
 
     file_count = files_service.count_files_by_path(db, scan_job.path_id)
