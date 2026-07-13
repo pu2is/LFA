@@ -1,13 +1,13 @@
 """run_scan's job-lifecycle bookkeeping (real directory discovery itself is
-covered in test_discovery.py / test_service.py, gated behind a real fixture
-directory). This test mocks discovery entirely so it runs everywhere."""
+covered in test_discovery.py / test_service.py). This test mocks discovery
+entirely so it stays focused on the status/error_message transition."""
 from unittest.mock import patch
 
 import pytest
 
 from app.modules.files.models import RegisteredPath
 from app.modules.jobs.models import Job
-from app.modules.jobs.service import mark_failed
+from app.modules.jobs.service import mark_failed, mark_running
 from app.modules.scans.service import run_scan
 
 
@@ -19,11 +19,12 @@ def scan_job(db):
 
     job = Job(type="scan", path_id=path.id, trigger="scan", mode="initial")
     db.add(job)
-    db.commit()
+    db.flush()
 
-    # Simulates a prior failed attempt (e.g. the path was unreadable last
-    # time) being re-run -- realistic setup via the real transition helper,
-    # not by hand-setting fields the code itself would never produce.
+    # Simulates a prior attempt that started, then failed (e.g. the path was
+    # unreadable), now being re-run -- via the real transition helpers, not
+    # by hand-setting fields into a state real code would never produce.
+    mark_running(db, job)
     mark_failed(db, job, RuntimeError("path was unreadable last time"))
     return job
 
