@@ -43,7 +43,11 @@ def _invoke_or_raise(structured_llm, messages, *, file_id: uuid.UUID):
 
     The log prefix is the immediate caller's function name, read from the
     stack rather than passed in -- it can never drift out of sync with
-    whoever's actually calling this.
+    whoever's actually calling this. Assumes it's called DIRECTLY by
+    suggest_labels/suggest_labels_augment (stack frame 1): if this ever
+    gets called through an added layer (a decorator, a retry wrapper, a
+    functools.partial), the logged name silently becomes that layer's
+    name instead of the real caller's. Re-check this if that changes.
 
     run_label marks the job failed and records error_message on this
     exception; RQ retries transient failures. A label job that produced
@@ -52,7 +56,7 @@ def _invoke_or_raise(structured_llm, messages, *, file_id: uuid.UUID):
     try:
         return structured_llm.invoke(messages)
     except Exception as exc:
-        caller = inspect.stack()[1].function
+        caller = inspect.stack()[1].function  # direct caller only, see docstring
         logger.warning("%s: LLM error for file %s: %s", caller, file_id, exc)
         raise
 
