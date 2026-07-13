@@ -15,6 +15,12 @@ router = APIRouter(tags=["paths"])
 def register_path(payload: PathCreate, db: Session = Depends(get_db)) -> RegisteredPath:
     if service.get_path_by_value(db, payload.path) is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Path is already registered")
+    conflict = service.find_ancestor_conflict(db, payload.path)
+    if conflict is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Path is nested under an already-registered path: {conflict.path}",
+        )
     return service.create_path(db, payload.path)
 
 
