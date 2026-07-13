@@ -1,4 +1,6 @@
+import uuid
 from collections.abc import Generator
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,3 +34,10 @@ def client(db) -> Generator[TestClient, None, None]:
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+def mock_rq_job(job_id: str | None = None) -> MagicMock:
+    """Fake return value for a mocked `Queue.enqueue()` call."""
+    rq_job = MagicMock()
+    rq_job.id = job_id or str(uuid.uuid4())
+    return rq_job

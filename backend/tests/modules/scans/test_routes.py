@@ -1,12 +1,13 @@
 """Tests for POST /scans enqueue bookkeeping (#33)."""
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import RegisteredPath
 from app.modules.jobs.models import Job
+from tests.conftest import mock_rq_job
 
 _FAKE_PATH = "D:/lfa_test_scan_routes"
 
@@ -20,15 +21,9 @@ def registered_path(db: Session):
     yield path
 
 
-def _mock_rq_job(job_id: str = "rq-scan-123") -> MagicMock:
-    rq_job = MagicMock()
-    rq_job.id = job_id
-    return rq_job
-
-
 @patch("app.modules.scans.routes.scan_queue")
 def test_create_scan_stores_rq_job_id(mock_q, client, db, registered_path):
-    mock_q.enqueue.return_value = _mock_rq_job("rq-scan-123")
+    mock_q.enqueue.return_value = mock_rq_job("rq-scan-123")
 
     resp = client.post("/scans", json={"path_id": str(registered_path.id)})
 

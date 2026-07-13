@@ -12,12 +12,7 @@ from unittest.mock import MagicMock, patch
 
 from app.modules.jobs.models import Job
 from app.modules.scans.tasks import run_scan_job
-
-
-def _mock_rq_job(job_id: str) -> MagicMock:
-    rq_job = MagicMock()
-    rq_job.id = job_id
-    return rq_job
+from tests.conftest import mock_rq_job
 
 
 @patch("app.modules.scans.tasks.ingest_queue")
@@ -29,7 +24,7 @@ def test_run_scan_job_records_rq_job_id_for_each_fanned_out_ingest_job(mock_serv
         Job(id=uuid.uuid4(), type="ingest", file_id=uuid.uuid4(), trigger="scan"),
     ]
     mock_service.run_scan.return_value = (MagicMock(), ingest_jobs)
-    mock_queue.enqueue.side_effect = [_mock_rq_job("rq-1"), _mock_rq_job("rq-2")]
+    mock_queue.enqueue.side_effect = [mock_rq_job("rq-1"), mock_rq_job("rq-2")]
 
     run_scan_job(scan_id)
 

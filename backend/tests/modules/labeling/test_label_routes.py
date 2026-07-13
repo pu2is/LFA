@@ -1,7 +1,7 @@
 """Tests for POST /label/files and POST /label/paths endpoints."""
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +14,7 @@ from app.modules.jobs.models import Job
 from app.modules.labeling.models import FileLabel, Label
 from app.shared.database import get_db
 from app.shared.queue import JOB_RETRY
+from tests.conftest import mock_rq_job
 
 _FAKE_PATH = "D:/lfa_test_label_routes"
 
@@ -138,12 +139,6 @@ def three_ready_files(db: Session):
     yield files
 
 
-def _mock_rq_job(job_id: str | None = None) -> MagicMock:
-    rq_job = MagicMock()
-    rq_job.id = job_id or str(uuid.uuid4())
-    return rq_job
-
-
 # ---------------------------------------------------------------------------
 # POST /label/files — initial mode
 # ---------------------------------------------------------------------------
@@ -151,7 +146,7 @@ def _mock_rq_job(job_id: str | None = None) -> MagicMock:
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_initial_returns_202(mock_q, client, path_and_ready_file):
     _, file = path_and_ready_file
-    mock_q.enqueue.return_value = _mock_rq_job()
+    mock_q.enqueue.return_value = mock_rq_job()
 
     resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
 
@@ -166,7 +161,7 @@ def test_label_files_initial_returns_202(mock_q, client, path_and_ready_file):
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_skips_non_ready(mock_q, client, path_with_mixed_files):
     _, ready, discovered = path_with_mixed_files
-    mock_q.enqueue.return_value = _mock_rq_job()
+    mock_q.enqueue.return_value = mock_rq_job()
 
     resp = client.post(
         "/label/files",
@@ -195,7 +190,7 @@ def test_label_files_unknown_id_returns_404(mock_q, client):
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_augment_for_labeled_file(mock_q, client, ready_file_with_labels):
     _, file = ready_file_with_labels
-    mock_q.enqueue.return_value = _mock_rq_job()
+    mock_q.enqueue.return_value = mock_rq_job()
 
     resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
 
@@ -212,7 +207,7 @@ def test_label_files_augment_for_labeled_file(mock_q, client, ready_file_with_la
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_creates_job_in_db(mock_q, client, db, path_and_ready_file):
     _, file = path_and_ready_file
-    mock_q.enqueue.return_value = _mock_rq_job()
+    mock_q.enqueue.return_value = mock_rq_job()
 
     resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
 
@@ -233,7 +228,7 @@ def test_label_files_creates_job_in_db(mock_q, client, db, path_and_ready_file):
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_paths_enqueues_ready_files(mock_q, client, path_with_mixed_files):
     path, ready, _discovered = path_with_mixed_files
-    mock_q.enqueue.return_value = _mock_rq_job()
+    mock_q.enqueue.return_value = mock_rq_job()
 
     resp = client.post("/label/paths", json={"path_ids": [str(path.id)]})
 
@@ -257,7 +252,7 @@ def test_label_paths_unknown_path_returns_404(mock_q, client):
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_stores_rq_job_id_on_job(mock_q, client, db, path_and_ready_file):
     _, file = path_and_ready_file
-    mock_q.enqueue.return_value = _mock_rq_job("rq-abc-123")
+    mock_q.enqueue.return_value = mock_rq_job("rq-abc-123")
 
     resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
 
@@ -269,7 +264,7 @@ def test_label_files_stores_rq_job_id_on_job(mock_q, client, db, path_and_ready_
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_enqueues_without_at_front_using_shared_retry(mock_q, client, path_and_ready_file):
     _, file = path_and_ready_file
-    mock_q.enqueue.return_value = _mock_rq_job()
+    mock_q.enqueue.return_value = mock_rq_job()
 
     client.post("/label/files", json={"file_ids": [str(file.id)]})
 
@@ -280,7 +275,7 @@ def test_label_files_enqueues_without_at_front_using_shared_retry(mock_q, client
 
 @patch("app.modules.labeling.routes.label_queue")
 def test_label_files_batch_enqueues_in_submission_order(mock_q, client, three_ready_files):
-    mock_q.enqueue.side_effect = [_mock_rq_job() for _ in three_ready_files]
+    mock_q.enqueue.side_effect = [mock_rq_job() for _ in three_ready_files]
     file_ids = [str(f.id) for f in three_ready_files]
 
     resp = client.post("/label/files", json={"file_ids": file_ids})
@@ -309,7 +304,7 @@ def test_label_files_batch_rolls_back_all_jobs_if_one_enqueue_fails(db: Session,
     local_client = TestClient(app, raise_server_exceptions=False)
 
     with patch("app.modules.labeling.routes.label_queue") as mock_q:
-        mock_q.enqueue.side_effect = [_mock_rq_job(), RuntimeError("redis unreachable"), _mock_rq_job()]
+        mock_q.enqueue.side_effect = [mock_rq_job(), RuntimeError("redis unreachable"), mock_rq_job()]
         file_ids = [str(f.id) for f in three_ready_files]
 
         resp = local_client.post("/label/files", json={"file_ids": file_ids})

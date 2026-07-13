@@ -9,12 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from app.modules.jobs.models import Job
 from app.modules.processing.tasks import run_ingest_job
-
-
-def _mock_rq_job(job_id: str) -> MagicMock:
-    rq_job = MagicMock()
-    rq_job.id = job_id
-    return rq_job
+from tests.conftest import mock_rq_job
 
 
 @patch("app.modules.processing.tasks.embed_queue")
@@ -23,7 +18,7 @@ def test_run_ingest_job_records_rq_job_id_on_embed_job(mock_service, mock_queue)
     job_id = uuid.uuid4()
     embed_job = Job(id=uuid.uuid4(), type="embed", file_id=uuid.uuid4(), trigger="scan")
     mock_service.run_ingest.return_value = (MagicMock(), embed_job)
-    mock_queue.enqueue.return_value = _mock_rq_job("rq-embed-1")
+    mock_queue.enqueue.return_value = mock_rq_job("rq-embed-1")
 
     run_ingest_job(job_id)
 
