@@ -1,5 +1,4 @@
 import uuid
-from datetime import datetime, timezone
 
 from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -8,9 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.modules.files.models import File
 from app.modules.jobs.models import Job
+from app.modules.jobs.service import mark_failed, mark_running, mark_succeeded
 from app.modules.rag.models import EMBEDDING_DIMENSIONS, FileChunk
 from app.shared.config import settings
-from app.shared.events import publish_job_status
 
 # Sized for the labeling step (#8), which only reads the first chunk or two --
 # large enough to cover a full paragraph, small enough to leave room in the
@@ -102,25 +101,14 @@ def run_embed(
     if job is None:
         raise ValueError(f"Job {job_id} not found")
 
-    job.status = "running"
-    job.error_message = None  # clear any stale error from a prior failed attempt (#33 retry)
-    job.started_at = datetime.now(timezone.utc)
-    db.commit()
-    publish_job_status(job)
+    mark_running(db, job)
 
     try:
         embed_file(db, job.file_id, embeddings=embeddings)
     except Exception as exc:
-        job.status = "failed"
-        job.error_message = str(exc)
-        job.completed_at = datetime.now(timezone.utc)
-        db.commit()
-        publish_job_status(job)
+        mark_failed(db, job, exc)
         raise
 
-    job.status = "succeeded"
-    job.completed_at = datetime.now(timezone.utc)
-    db.commit()
-    publish_job_status(job)
+    mark_succeeded(db, job)
 
     return job

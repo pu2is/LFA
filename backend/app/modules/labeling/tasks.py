@@ -1,14 +1,13 @@
 import uuid
-from datetime import datetime, timezone
 
 from langchain_core.language_models import BaseChatModel
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File
 from app.modules.jobs.models import Job
+from app.modules.jobs.service import mark_failed, mark_running, mark_succeeded
 from app.modules.labeling.suggestion import suggest_labels, suggest_labels_augment
 from app.shared.database import SessionLocal
-from app.shared.events import publish_job_status
 
 
 def run_label(
@@ -26,12 +25,8 @@ def run_label(
     if file is None:
         raise ValueError(f"File {job.file_id} not found")
 
-    job.status = "running"
     job.stage = "labeling"
-    job.error_message = None  # clear any stale error from a prior failed attempt (#33 retry)
-    job.started_at = datetime.now(timezone.utc)
-    db.commit()
-    publish_job_status(job)
+    mark_running(db, job)
 
     try:
         if job.mode == "augment":
@@ -39,18 +34,11 @@ def run_label(
         else:
             suggest_labels(db, file.id, llm=llm)
     except Exception as exc:
-        job.status = "failed"
-        job.error_message = str(exc)
-        job.completed_at = datetime.now(timezone.utc)
-        db.commit()
-        publish_job_status(job)
+        mark_failed(db, job, exc)
         raise
 
-    job.status = "succeeded"
     job.stage = None
-    job.completed_at = datetime.now(timezone.utc)
-    db.commit()
-    publish_job_status(job)
+    mark_succeeded(db, job)
 
     return job
 

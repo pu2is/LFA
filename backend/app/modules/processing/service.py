@@ -1,14 +1,13 @@
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File
 from app.modules.jobs.models import Job
+from app.modules.jobs.service import mark_failed, mark_progress, mark_running, mark_succeeded
 from app.modules.processing import cleaning, extraction
 from app.modules.rag import service as rag_service
-from app.shared.events import publish_job_status
 
 
 def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
@@ -27,45 +26,32 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
     if file is None:
         raise ValueError(f"File {job.file_id} not found")
 
-    job.status = "running"
     job.stage = "extract"
-    job.error_message = None  # clear any stale error from a prior failed attempt (#33 retry)
-    job.started_at = datetime.now(timezone.utc)
     file.status = "processing"
-    db.commit()
-    publish_job_status(job)
+    mark_running(db, job)
 
     try:
         result = extraction.extract_text(Path(file.full_path), file.file_type)
     except Exception as exc:
-        job.status = "failed"
-        job.error_message = str(exc)
-        job.completed_at = datetime.now(timezone.utc)
         file.status = "failed"
-        db.commit()
-        publish_job_status(job)
+        mark_failed(db, job, exc)
         return job, None
 
     job.stage = "clean"
     if result.ocr_applied:
         file.ocr_applied = True
-    db.commit()
-    publish_job_status(job)
+    mark_progress(db, job)
 
     cleaned_text = cleaning.clean(result.text)
 
     job.stage = "chunk"
-    db.commit()
-    publish_job_status(job)
+    mark_progress(db, job)
 
     rag_service.chunk_and_store(db, file.id, cleaned_text)
     db.commit()
 
-    job.status = "succeeded"
-    job.completed_at = datetime.now(timezone.utc)
     file.status = "ready"
-    db.commit()
-    publish_job_status(job)
+    mark_succeeded(db, job)
 
     embed_job = Job(
         type="embed",
