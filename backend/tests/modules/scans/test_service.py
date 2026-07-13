@@ -91,6 +91,18 @@ def test_run_scan_updates_path_last_scanned_at(db, registered_path):
     assert registered_path.last_scanned_at is not None
 
 
+def test_run_scan_clears_stale_error_message_on_success(db, registered_path):
+    scan_job = _queue_scan(db, registered_path.id)
+    scan_job.status = "failed"
+    scan_job.error_message = "path was unreadable last time"
+    db.commit()
+
+    result_job, _ingest_jobs = run_scan(db, scan_job.id)
+
+    assert result_job.status == "succeeded"
+    assert result_job.error_message is None
+
+
 def test_create_scan_starts_queued(db, registered_path):
     scan = create_scan(db, registered_path.id)
 
