@@ -7,10 +7,15 @@ timestamp, commit, and publish mechanics that were otherwise duplicated
 near-identically across every job type.
 
 One exception: scan's succeeded transition (scans/service.py::run_scan)
-stays inline rather than calling mark_succeeded. It computes file_count,
-updates registered_path.last_scanned_at, and passes file_count as an extra
-publish_job_status kwarg -- none of which fit mark_succeeded's plain
-(db, job) signature, and it's not worth parameterizing for one caller.
+stays inline rather than calling mark_succeeded. Not because of the extra
+publish_job_status kwarg (publish_job_status already accepts **extra) --
+the real blocker is that it also updates a SECOND model in the same
+commit, registered_path.last_scanned_at, using the exact timestamp
+mark_succeeded computes internally. That timestamp can't be obtained
+before calling mark_succeeded (it doesn't exist yet) or supplied after
+(that would mean a second db.commit(), breaking atomicity between "job
+succeeded" and "path's last-scanned time updated"). Not worth a
+callback/extra-commit-object parameter for one caller.
 """
 from datetime import datetime, timezone
 
