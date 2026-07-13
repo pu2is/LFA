@@ -1,3 +1,4 @@
+import inspect
 import logging
 import uuid
 
@@ -37,8 +38,12 @@ def _ensure_label_catalog(db: Session) -> list[Label]:
     return new_labels
 
 
-def _invoke_or_raise(structured_llm, messages, *, log_prefix: str, file_id: uuid.UUID):
+def _invoke_or_raise(structured_llm, messages, *, file_id: uuid.UUID):
     """Fail loud: log then re-raise any LLM/parse error, never swallow it.
+
+    The log prefix is the immediate caller's function name, read from the
+    stack rather than passed in -- it can never drift out of sync with
+    whoever's actually calling this.
 
     run_label marks the job failed and records error_message on this
     exception; RQ retries transient failures. A label job that produced
@@ -47,7 +52,8 @@ def _invoke_or_raise(structured_llm, messages, *, log_prefix: str, file_id: uuid
     try:
         return structured_llm.invoke(messages)
     except Exception as exc:
-        logger.warning("%s: LLM error for file %s: %s", log_prefix, file_id, exc)
+        caller = inspect.stack()[1].function
+        logger.warning("%s: LLM error for file %s: %s", caller, file_id, exc)
         raise
 
 
@@ -125,9 +131,7 @@ def suggest_labels(
         text="\n\n".join(c.content for c in chunks),
     )
 
-    output: LabelSuggestionOutput = _invoke_or_raise(
-        structured_llm, messages, log_prefix="suggest_labels", file_id=file_id
-    )
+    output: LabelSuggestionOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
 
     file_labels = write_initial_candidates(db, file_id, output, labels)
 
@@ -168,9 +172,7 @@ def suggest_labels_augment(
         text="\n\n".join(c.content for c in chunks),
     )
 
-    output: AugmentSuggestionOutput = _invoke_or_raise(
-        structured_llm, messages, log_prefix="suggest_labels_augment", file_id=file_id
-    )
+    output: AugmentSuggestionOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
 
     file_labels = append_augment_candidates(db, file_id, output, labels)
 
