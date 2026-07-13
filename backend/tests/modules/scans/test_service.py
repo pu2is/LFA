@@ -8,16 +8,13 @@ from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
 from app.modules.scans.service import create_scan, get_scan, run_scan
 
-TEST_DIR = Path("E:/lfa_test")
-
-pytestmark = pytest.mark.skipif(
-    not TEST_DIR.exists(), reason="E:\\lfa_test fixture directory not present on this machine"
-)
-
 
 @pytest.fixture
-def registered_path(db):
-    path = RegisteredPath(path=str(TEST_DIR.resolve()))
+def registered_path(db, tmp_path: Path):
+    (tmp_path / "report.pdf").write_bytes(b"pdf-content")
+    (tmp_path / "contract.docx").write_bytes(b"docx-content")
+
+    path = RegisteredPath(path=str(tmp_path.resolve()))
     db.add(path)
     db.commit()
     yield path
