@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from pathlib import Path as FsPath
 
 from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session
@@ -26,9 +27,42 @@ def list_paths(db: Session) -> list[RegisteredPath]:
     return list(db.scalars(select(RegisteredPath)))
 
 
+def find_ancestor_conflict(db: Session, resolved_path: str) -> RegisteredPath | None:
+    """Return an existing registered path that `resolved_path` is nested under, if any.
+
+    Segment-based comparison (`Path.is_relative_to`), not SQL LIKE prefix
+    matching: "/home/coll" is not a parent of "/home/collection" but a
+    string-prefix check would wrongly say it is.
+    """
+    candidate = FsPath(resolved_path)
+    for existing in list_paths(db):
+        if candidate != FsPath(existing.path) and candidate.is_relative_to(existing.path):
+            return existing
+    return None
+
+
+def _adopt_orphans(db: Session, new_path: RegisteredPath) -> None:
+    """Re-point existing orphan descendants of `new_path` to it.
+
+    Paths that already have a parent are left untouched -- they already
+    point at a nearer registered ancestor (see the nearest-ancestor
+    invariant in docs/workflow/00a-path-register.md).
+    """
+    candidate = FsPath(new_path.path)
+    for existing in list_paths(db):
+        if (
+            existing.id != new_path.id
+            and existing.parent_path_id is None
+            and FsPath(existing.path).is_relative_to(candidate)
+        ):
+            existing.parent_path_id = new_path.id
+
+
 def create_path(db: Session, path: str) -> RegisteredPath:
     registered_path = RegisteredPath(path=path)
     db.add(registered_path)
+    db.flush()
+    _adopt_orphans(db, registered_path)
     db.commit()
     db.refresh(registered_path)
     return registered_path
