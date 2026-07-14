@@ -88,3 +88,86 @@ AUGMENT_SUGGESTION_PROMPT = ChatPromptTemplate.from_messages(
         ),
     ]
 )
+
+
+# --------------------------------------------------------------------------- #
+# Initial labeling, ADR-0001 D3 (mode=initial): three sequential structured
+# calls sharing one growing message history -- type, then kinds, then one
+# focused call per chosen kind for its tag values. Each schema is
+# deliberately narrower than LabelSuggestionOutput above: type and kind are
+# both closed catalogs (no free-text invention), so splitting the "which
+# kind" decision (Call 2) from "what values" (Call 3) means Call 3 never has
+# to also guess the kind -- see ADR-0001 D3.
+# --------------------------------------------------------------------------- #
+
+class InitialTypeCandidate(BaseModel):
+    name: str = Field(description="Document type name exactly as it appears in the available types list")
+
+
+class InitialTypeSuggestionOutput(BaseModel):
+    types: list[InitialTypeCandidate] = Field(
+        default_factory=list,
+        description="At most 3 document types from the catalog that best describe this document",
+    )
+
+
+INITIAL_TYPE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a document classification assistant helping organize a user's personal files. "
+            "You will be asked a short sequence of related questions about the SAME document. "
+            "Only choose from the options given in each question — never invent your own categories.",
+        ),
+        (
+            "human",
+            "Document excerpt:\n{text}\n\n"
+            "Available document types: {type_names}\n\n"
+            "Which of these types apply to this document? Choose at most 3, "
+            "picking only names from the list above.",
+        ),
+    ]
+)
+
+
+class InitialKindCandidate(BaseModel):
+    name: str = Field(description="Tag kind name exactly as it appears in the available kinds list")
+
+
+class InitialKindSuggestionOutput(BaseModel):
+    kinds: list[InitialKindCandidate] = Field(
+        default_factory=list,
+        description="Which tag kinds from the catalog are likely to have relevant information in this document",
+    )
+
+
+INITIAL_KIND_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "human",
+            "Available tag categories: {kind_names}\n\n"
+            "Given the document and the type(s) you just identified, which of these "
+            "categories are likely to have relevant information in this document? "
+            "Pick only names from the list above.",
+        ),
+    ]
+)
+
+
+class InitialTagValuesOutput(BaseModel):
+    values: list[str] = Field(
+        default_factory=list,
+        description="Every specific value for this tag kind mentioned in the document. Empty list if none appear.",
+    )
+
+
+INITIAL_TAG_VALUES_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "human",
+            "Focus only on the category '{kind_name}'.\n"
+            "List every specific '{kind_name}' value mentioned in the document "
+            "(e.g. for 'person', list actual names). Return an empty list if none appear.",
+        ),
+    ]
+)

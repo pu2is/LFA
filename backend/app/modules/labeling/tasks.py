@@ -25,14 +25,17 @@ def run_label(
     if file is None:
         raise ValueError(f"File {job.file_id} not found")
 
-    job.stage = "labeling"
-    mark_running(db, job)
-
     try:
         if job.mode == "augment":
+            job.stage = "labeling"
+            mark_running(db, job)
             suggest_labels_augment(db, file.id, llm=llm)
         else:
-            suggest_labels(db, file.id, llm=llm)
+            # First of the type -> kinds -> tags sequence (ADR-0001 D3);
+            # suggest_labels advances job.stage through the rest itself.
+            job.stage = "type"
+            mark_running(db, job)
+            suggest_labels(db, file.id, job, llm=llm)
     except Exception as exc:
         mark_failed(db, job, exc)
         raise
