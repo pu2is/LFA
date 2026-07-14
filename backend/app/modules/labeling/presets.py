@@ -31,6 +31,15 @@ OPTIONAL_LABELS: tuple[str, ...] = (
     "academic_paper",
 )
 
+# Starter controlled vocabulary for tag_kinds (ADR-0001 D1); "topic" is the catch-all.
+TAG_KIND_PRESETS: tuple[str, ...] = (
+    "person",
+    "organization",
+    "time",
+    "place",
+    "topic",
+)
+
 
 def get_preset_catalog() -> list[dict[str, str | bool]]:
     return [{"name": name, "recommended": True} for name in RECOMMENDED_LABELS] + [

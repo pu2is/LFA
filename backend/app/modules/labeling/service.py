@@ -3,7 +3,8 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.labeling.models import FileLabel, Label
+from app.modules.labeling.models import FileLabel, Label, TagKind, TypeLabel
+from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS, TAG_KIND_PRESETS
 
 
 def normalize_label_name(raw: str) -> str:
@@ -119,3 +120,36 @@ def add_user_label(db: Session, file_id: uuid.UUID, label: Label) -> FileLabel:
 def remove_file_label(db: Session, fl: FileLabel) -> None:
     db.delete(fl)
     db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0001 foundation: catalog seed helpers (type_labels / tag_kinds)
+# --------------------------------------------------------------------------- #
+
+def ensure_type_catalog(db: Session) -> list[TypeLabel]:
+    """Return all type_labels; auto-populate from presets if empty."""
+    types = list(db.scalars(select(TypeLabel)))
+    if types:
+        return types
+
+    all_preset_names = list(RECOMMENDED_LABELS) + list(OPTIONAL_LABELS)
+    new_types = [TypeLabel(name=name) for name in all_preset_names]
+    db.add_all(new_types)
+    db.commit()
+    for t in new_types:
+        db.refresh(t)
+    return new_types
+
+
+def ensure_tag_kind_catalog(db: Session) -> list[TagKind]:
+    """Return all tag_kinds; auto-populate from TAG_KIND_PRESETS if empty."""
+    kinds = list(db.scalars(select(TagKind)))
+    if kinds:
+        return kinds
+
+    new_kinds = [TagKind(name=name) for name in TAG_KIND_PRESETS]
+    db.add_all(new_kinds)
+    db.commit()
+    for k in new_kinds:
+        db.refresh(k)
+    return new_kinds
