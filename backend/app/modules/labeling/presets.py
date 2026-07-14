@@ -39,9 +39,3 @@ TAG_KIND_PRESETS: tuple[str, ...] = (
     "place",
     "topic",
 )
-
-
-def get_preset_catalog() -> list[dict[str, str | bool]]:
-    return [{"name": name, "recommended": True} for name in RECOMMENDED_LABELS] + [
-        {"name": name, "recommended": False} for name in OPTIONAL_LABELS
-    ]

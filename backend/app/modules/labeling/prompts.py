@@ -1,64 +1,16 @@
-"""LLM output schemas and prompt templates for label suggestion (initial; the
-old single-call flat-schema augment approach is superseded by ADR-0001 D4 f1
-below, which reuses TagValuesOutput)."""
+"""LLM output schemas and prompt templates for label suggestion (initial +
+augment, ADR-0001 D3/D4)."""
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
-
-
-class CatalogCandidate(BaseModel):
-    name: str = Field(description="Label name exactly as it appears in the available labels list")
-
-
-class FreetextCandidate(BaseModel):
-    name: str = Field(description="A specific label name you invented; use lowercase_with_underscores")
-
-
-class LabelSuggestionOutput(BaseModel):
-    catalog_picks: list[CatalogCandidate] = Field(
-        default_factory=list,
-        description="Labels chosen from the provided list that apply to this document",
-    )
-    free_suggestions: list[FreetextCandidate] = Field(
-        default_factory=list,
-        description=(
-            "Additional specific labels you invented that better describe this document "
-            "and are NOT already covered by the catalog labels above. "
-            "Use lowercase_with_underscores."
-        ),
-    )
-
-
-INITIAL_SUGGESTION_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a document classification assistant. "
-            "Your job is to label documents as thoroughly as possible.\n\n"
-            "You have two tasks:\n"
-            "1. Select every applicable label from the provided catalog list.\n"
-            "2. Suggest additional fine-grained labels NOT in the list "
-            "if they describe the document more specifically (e.g. 'car_rental_agreement' "
-            "instead of just 'contract'). Use lowercase_with_underscores.\n\n"
-            "Be generous — more labels help the user; they will confirm or reject each one.",
-        ),
-        (
-            "human",
-            "Available catalog labels: {label_names}\n\n"
-            "Document excerpt:\n{text}\n\n"
-            "Return catalog_picks (from the list above) and free_suggestions (your own additions).",
-        ),
-    ]
-)
 
 
 # --------------------------------------------------------------------------- #
 # Initial labeling, ADR-0001 D3 (mode=initial): three sequential structured
 # calls sharing one growing message history -- type, then kinds, then one
-# focused call per chosen kind for its tag values. Each schema is
-# deliberately narrower than LabelSuggestionOutput above: type and kind are
-# both closed catalogs (no free-text invention), so splitting the "which
-# kind" decision (Call 2) from "what values" (Call 3) means Call 3 never has
-# to also guess the kind -- see ADR-0001 D3.
+# focused call per chosen kind for its tag values. Type and kind are both
+# closed catalogs (no free-text invention), so splitting the "which kind"
+# decision (Call 2) from "what values" (Call 3) means Call 3 never has to
+# also guess the kind -- see ADR-0001 D3.
 # --------------------------------------------------------------------------- #
 
 class InitialTypeCandidate(BaseModel):

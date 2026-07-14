@@ -1,79 +1,16 @@
-"""Write LLM suggestion output into file_labels, with dedup against the existing catalog."""
+"""Write LLM suggestion output into type_labels_files / tag_labels, with
+dedup against the existing catalog / existing rows."""
 import logging
 import uuid
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.labeling.models import FileLabel, Label, TagKind, TagLabel, TypeLabel, TypeLabelFile
-from app.modules.labeling.prompts import (
-    InitialKindSuggestionOutput,
-    InitialTypeSuggestionOutput,
-    LabelSuggestionOutput,
-    TagValuesOutput,
-)
+from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
+from app.modules.labeling.prompts import InitialKindSuggestionOutput, InitialTypeSuggestionOutput, TagValuesOutput
 from app.modules.labeling.service import normalize_label_name
 
 logger = logging.getLogger(__name__)
-
-
-def write_initial_candidates(
-    db: Session,
-    file_id: uuid.UUID,
-    output: LabelSuggestionOutput,
-    labels: list[Label],
-) -> list[FileLabel]:
-    """Write LLM candidates to file_labels for first-time labeling (mode=initial).
-
-    Pure INSERT — initial mode targets files with no existing file_labels.
-    """
-    label_by_name = {normalize_label_name(lbl.name): lbl for lbl in labels}
-    file_labels: list[FileLabel] = []
-    seen_label_ids: set[uuid.UUID] = set()
-
-    for candidate in output.catalog_picks:
-        norm = normalize_label_name(candidate.name)
-        lbl = label_by_name.get(norm)
-        if lbl is None:
-            logger.debug("write_initial: catalog pick %r not in label catalog — skipping", candidate.name)
-            continue
-        if lbl.id in seen_label_ids:
-            continue
-        seen_label_ids.add(lbl.id)
-
-        fl = FileLabel(
-            file_id=file_id,
-            label_id=lbl.id,
-            label_name=lbl.name,
-            source="llm",
-            status="suggested",
-        )
-        db.add(fl)
-        file_labels.append(fl)
-
-    seen_free_names: set[str] = set()
-    for candidate in output.free_suggestions:
-        normalized = normalize_label_name(candidate.name)
-        if not normalized:
-            continue
-        if normalized in label_by_name:
-            continue
-        if normalized in seen_free_names:
-            continue
-        seen_free_names.add(normalized)
-
-        fl = FileLabel(
-            file_id=file_id,
-            label_id=None,
-            label_name=normalized,
-            source="llm",
-            status="suggested",
-        )
-        db.add(fl)
-        file_labels.append(fl)
-
-    db.flush()
-    return file_labels
 
 
 # --------------------------------------------------------------------------- #
