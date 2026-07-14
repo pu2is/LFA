@@ -2,6 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.modules.files import service as files_service
@@ -22,6 +23,18 @@ from app.modules.labeling.schemas import (
     LabelJobSkipped,
     LabelRead,
     PresetRead,
+    TagKindBulkCreate,
+    TagKindBulkCreateResult,
+    TagKindRead,
+    TagLabelAdd,
+    TagLabelBatchPatch,
+    TagLabelRead,
+    TypeLabelBulkCreate,
+    TypeLabelBulkCreateResult,
+    TypeLabelFileAdd,
+    TypeLabelFileBatchPatch,
+    TypeLabelFileRead,
+    TypeLabelRead,
 )
 from app.modules.labeling.tasks import run_label_job
 from app.shared.database import get_db
@@ -196,4 +209,170 @@ def remove_file_label(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File label not found")
     deleted = FileLabelRead.model_validate(fl)
     service.remove_file_label(db, fl)
+    return deleted
+
+
+# --- Type-label catalog CRUD (ADR-0001) ---
+
+@router.get("/type-labels", response_model=list[TypeLabelRead])
+def list_type_labels(db: Session = Depends(get_db)):
+    return service.list_type_labels(db)
+
+
+@router.post("/type-labels", response_model=TypeLabelBulkCreateResult, status_code=status.HTTP_201_CREATED)
+def create_type_labels(payload: TypeLabelBulkCreate, db: Session = Depends(get_db)):
+    created, skipped = service.bulk_create_type_labels(db, payload.names)
+    return {"created": created, "skipped": skipped}
+
+
+@router.delete("/type-labels/{type_label_id}", response_model=TypeLabelRead)
+def remove_type_label(type_label_id: uuid.UUID, db: Session = Depends(get_db)) -> TypeLabelRead:
+    type_label = service.get_type_label(db, type_label_id)
+    if type_label is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Type label not found")
+
+    deleted = TypeLabelRead.model_validate(type_label)
+    try:
+        service.delete_type_label(db, type_label)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Type label is still referenced by one or more files",
+        )
+    return deleted
+
+
+# --- Tag-kind catalog CRUD (ADR-0001) ---
+
+@router.get("/tag-kinds", response_model=list[TagKindRead])
+def list_tag_kinds(db: Session = Depends(get_db)):
+    return service.list_tag_kinds(db)
+
+
+@router.post("/tag-kinds", response_model=TagKindBulkCreateResult, status_code=status.HTTP_201_CREATED)
+def create_tag_kinds(payload: TagKindBulkCreate, db: Session = Depends(get_db)):
+    created, skipped = service.bulk_create_tag_kinds(db, payload.names)
+    return {"created": created, "skipped": skipped}
+
+
+@router.delete("/tag-kinds/{tag_kind_id}", response_model=TagKindRead)
+def remove_tag_kind(tag_kind_id: uuid.UUID, db: Session = Depends(get_db)) -> TagKindRead:
+    tag_kind = service.get_tag_kind(db, tag_kind_id)
+    if tag_kind is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag kind not found")
+
+    deleted = TagKindRead.model_validate(tag_kind)
+    try:
+        service.delete_tag_kind(db, tag_kind)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tag kind is still referenced by one or more files",
+        )
+    return deleted
+
+
+# --- Type-label file review endpoints (ADR-0001 / 01x) ---
+
+@router.get("/files/{file_id}/type-labels", response_model=list[TypeLabelFileRead])
+def list_file_type_labels(file_id: uuid.UUID, db: Session = Depends(get_db)):
+    _require_file(db, file_id)
+    return service.list_type_labels_files(db, file_id)
+
+
+@router.patch("/files/{file_id}/type-labels", response_model=list[TypeLabelFileRead])
+def batch_patch_file_type_labels(
+    file_id: uuid.UUID,
+    payload: TypeLabelFileBatchPatch,
+    db: Session = Depends(get_db),
+):
+    _require_file(db, file_id)
+    try:
+        return service.batch_patch_type_labels_files(
+            db, file_id, [(op.type_label_file_id, op.action) for op in payload.operations]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@router.post("/files/{file_id}/type-labels", response_model=TypeLabelFileRead, status_code=status.HTTP_201_CREATED)
+def add_user_type_label(
+    file_id: uuid.UUID,
+    payload: TypeLabelFileAdd,
+    db: Session = Depends(get_db),
+):
+    _require_file(db, file_id)
+    type_label = service.get_type_label(db, payload.type_label_id)
+    if type_label is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Type label not found")
+    if service.get_type_labels_file_by_catalog(db, file_id, payload.type_label_id) is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Type label already attached to this file")
+    return service.add_user_type_label(db, file_id, type_label)
+
+
+@router.delete("/files/{file_id}/type-labels/{type_label_file_id}", response_model=TypeLabelFileRead)
+def remove_file_type_label(
+    file_id: uuid.UUID,
+    type_label_file_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    row = service.get_type_labels_file_by_id(db, type_label_file_id)
+    if row is None or row.file_id != file_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Type label file not found")
+    deleted = TypeLabelFileRead.model_validate(row)
+    service.remove_type_labels_file(db, row)
+    return deleted
+
+
+# --- Tag-label file review endpoints (ADR-0001 / 01x) ---
+
+@router.get("/files/{file_id}/tags", response_model=list[TagLabelRead])
+def list_file_tags(file_id: uuid.UUID, db: Session = Depends(get_db)):
+    _require_file(db, file_id)
+    return service.list_tag_labels(db, file_id)
+
+
+@router.patch("/files/{file_id}/tags", response_model=list[TagLabelRead])
+def batch_patch_file_tags(
+    file_id: uuid.UUID,
+    payload: TagLabelBatchPatch,
+    db: Session = Depends(get_db),
+):
+    _require_file(db, file_id)
+    try:
+        return service.batch_patch_tag_labels(
+            db, file_id, [(op.tag_label_id, op.action) for op in payload.operations]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@router.post("/files/{file_id}/tags", response_model=TagLabelRead, status_code=status.HTTP_201_CREATED)
+def add_user_tag(
+    file_id: uuid.UUID,
+    payload: TagLabelAdd,
+    db: Session = Depends(get_db),
+):
+    _require_file(db, file_id)
+    kind = service.get_tag_kind(db, payload.kind_id)
+    if kind is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag kind not found")
+    if service.get_tag_label_by_kind_and_value(db, file_id, payload.kind_id, payload.value) is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tag already attached to this file")
+    return service.add_user_tag_label(db, file_id, kind, payload.value)
+
+
+@router.delete("/files/{file_id}/tags/{tag_label_id}", response_model=TagLabelRead)
+def remove_file_tag(
+    file_id: uuid.UUID,
+    tag_label_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    row = service.get_tag_label_by_id(db, tag_label_id)
+    if row is None or row.file_id != file_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag not found")
+    deleted = TagLabelRead.model_validate(row)
+    service.remove_tag_label(db, row)
     return deleted
