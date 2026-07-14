@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.main import app
 from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
-from app.modules.labeling.models import FileLabel, Label
+from app.modules.labeling.models import TagKind, TagLabel
 from app.shared.database import get_db
 from app.shared.queue import JOB_RETRY
 from tests.conftest import mock_rq_job
@@ -77,7 +77,8 @@ def path_with_mixed_files(db: Session):
 
 @pytest.fixture
 def ready_file_with_labels(db: Session):
-    """A ready file that already has file_labels — triggers augment mode."""
+    """A ready file that already has tag_labels — triggers augment mode
+    (service.file_has_type_or_tag_labels)."""
     path = RegisteredPath(path=_FAKE_PATH)
     db.add(path)
     db.flush()
@@ -95,18 +96,18 @@ def ready_file_with_labels(db: Session):
     db.add(file)
     db.flush()
 
-    lbl = Label(name="lr_test_invoice")
-    db.add(lbl)
+    kind = TagKind(name="lr_test_person")
+    db.add(kind)
     db.flush()
 
-    fl = FileLabel(
+    tag = TagLabel(
         file_id=file.id,
-        label_id=lbl.id,
-        label_name=lbl.name,
+        kind_id=kind.id,
+        value="lr_test_value",
         source="llm",
         status="confirmed",
     )
-    db.add(fl)
+    db.add(tag)
     db.commit()
     db.refresh(file)
     yield path, file

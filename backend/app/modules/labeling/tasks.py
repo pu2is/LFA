@@ -27,7 +27,8 @@ def run_label(
 
     try:
         if job.mode == "augment":
-            job.stage = "labeling"
+            # ADR-0001 D4 f1: no type/kinds stages here, only "tags" (01c).
+            job.stage = "tags"
             mark_running(db, job)
             suggest_labels_augment(db, file.id, llm=llm)
         else:

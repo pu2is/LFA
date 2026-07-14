@@ -1,5 +1,5 @@
 """run_label's job-lifecycle bookkeeping (suggestion logic itself is covered
-in test_suggest_labels.py / test_merge_labels.py)."""
+in test_suggest_labels.py / test_suggest_labels_augment.py)."""
 from unittest.mock import patch
 
 import pytest
@@ -73,11 +73,11 @@ def test_run_label_initial_failure_preserves_stage_reached(mock_suggest_labels, 
 
 
 # --------------------------------------------------------------------------- #
-# Augment mode is untouched by the D3 rewrite (separate follow-up ticket)
+# ADR-0001 D4 f1: augment has no type/kinds stages, only "tags" (see 01c)
 # --------------------------------------------------------------------------- #
 
 @patch("app.modules.labeling.tasks.suggest_labels_augment")
-def test_run_label_augment_still_uses_single_labeling_stage(mock_suggest_labels_augment, db, augment_label_job):
+def test_run_label_augment_uses_single_tags_stage(mock_suggest_labels_augment, db, augment_label_job):
     captured_stage = None
 
     def _capture(_db, _file_id, **_kwargs):
@@ -89,6 +89,6 @@ def test_run_label_augment_still_uses_single_labeling_stage(mock_suggest_labels_
 
     result = run_label(db, augment_label_job.id)
 
-    assert captured_stage == "labeling"
+    assert captured_stage == "tags"
     assert result.status == "succeeded"
     assert result.stage is None

@@ -79,7 +79,7 @@ def _enqueue_label_jobs(
             skipped.append(LabelJobSkipped(file_id=file.id, reason=f"status is '{file.status}', not 'ready'"))
             continue
 
-        has_labels = service.file_has_labels(db, file.id)
+        has_labels = service.file_has_type_or_tag_labels(db, file.id)
         mode = "augment" if has_labels else "initial"
 
         job = Job(type="label", file_id=file.id, trigger="manual", mode=mode)

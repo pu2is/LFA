@@ -18,9 +18,9 @@ from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelF
 from app.modules.labeling.prompts import (
     InitialKindCandidate,
     InitialKindSuggestionOutput,
-    InitialTagValuesOutput,
     InitialTypeCandidate,
     InitialTypeSuggestionOutput,
+    TagValuesOutput,
 )
 from app.modules.labeling.suggestion import suggest_labels
 from app.modules.rag.models import FileChunk
@@ -93,7 +93,7 @@ def _mock_llm(
 
     tag_chain = MagicMock()
     tag_chain.invoke.side_effect = [
-        InitialTagValuesOutput(values=values) for values in (tag_values_per_kind or [])
+        TagValuesOutput(values=values) for values in (tag_values_per_kind or [])
     ]
 
     mock_llm = MagicMock()
@@ -260,12 +260,13 @@ def test_suggest_labels_advances_stage_through_kinds_and_tags(db, file_and_job, 
 
 
 def test_suggest_labels_rerun_on_same_file_is_idempotent_not_a_crash(db, file_and_job, seeded_catalogs):
-    """RQ retries reuse the same job row (#33), and a user can re-trigger
-    /label/files before the file has any type_labels_files/tag_labels (still
-    routes to mode=initial, see routes.py::file_has_labels). Either way,
-    suggest_labels running twice on the same file with overlapping LLM
-    output must not hit the (file_id, type_label_id) / (file_id, kind_id,
-    value) UNIQUE constraints."""
+    """RQ retries reuse the same job row (#33). Once this file has ANY
+    type_labels_files/tag_labels row, /label routes it to mode=augment (see
+    service.file_has_type_or_tag_labels) instead of calling suggest_labels
+    again -- but suggest_labels itself must still be safe to call twice
+    directly (e.g. a retry mid-run, before any row exists yet): running it
+    twice with overlapping LLM output must not hit the (file_id,
+    type_label_id) / (file_id, kind_id, value) UNIQUE constraints."""
     file, job = file_and_job
 
     def _make_llm():

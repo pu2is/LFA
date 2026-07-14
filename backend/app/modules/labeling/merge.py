@@ -7,11 +7,10 @@ from sqlalchemy.orm import Session
 
 from app.modules.labeling.models import FileLabel, Label, TagKind, TagLabel, TypeLabel, TypeLabelFile
 from app.modules.labeling.prompts import (
-    AugmentSuggestionOutput,
     InitialKindSuggestionOutput,
-    InitialTagValuesOutput,
     InitialTypeSuggestionOutput,
     LabelSuggestionOutput,
+    TagValuesOutput,
 )
 from app.modules.labeling.service import normalize_label_name
 
@@ -67,45 +66,6 @@ def write_initial_candidates(
             file_id=file_id,
             label_id=None,
             label_name=normalized,
-            source="llm",
-            status="suggested",
-        )
-        db.add(fl)
-        file_labels.append(fl)
-
-    db.flush()
-    return file_labels
-
-
-def append_augment_candidates(
-    db: Session,
-    file_id: uuid.UUID,
-    output: AugmentSuggestionOutput,
-    labels: list[Label],
-) -> list[FileLabel]:
-    """Append-only write for augment mode: INSERT new names, never touch existing rows."""
-    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
-    existing_names: set[str] = {normalize_label_name(fl.label_name) for fl in existing}
-
-    label_by_name = {normalize_label_name(lbl.name): lbl for lbl in labels}
-    file_labels: list[FileLabel] = []
-    seen_names: set[str] = set()
-
-    for candidate in output.new_labels:
-        normalized = normalize_label_name(candidate.name)
-        if not normalized:
-            continue
-        if normalized in existing_names:
-            continue
-        if normalized in seen_names:
-            continue
-        seen_names.add(normalized)
-
-        lbl = label_by_name.get(normalized)
-        fl = FileLabel(
-            file_id=file_id,
-            label_id=lbl.id if lbl else None,
-            label_name=lbl.name if lbl else normalized,
             source="llm",
             status="suggested",
         )
@@ -185,17 +145,22 @@ def write_tag_candidates(
     db: Session,
     file_id: uuid.UUID,
     kind: TagKind,
-    output: InitialTagValuesOutput,
+    output: TagValuesOutput,
 ) -> list[TagLabel]:
-    """Write one Call-3 iteration's tag values for a single kind to tag_labels.
+    """Write one kind's worth of tag values to tag_labels -- shared by initial
+    Call 3 and augment's per-kind call, since both are "insert new values
+    under this (file, kind), dedup against what's already there."
 
     Unlike type names, tag values are free text and are NOT case-normalized
     (e.g. a person's name) -- only exact-duplicate/blank values are dropped.
     An empty output simply writes nothing; no special-casing needed.
 
-    Idempotent against (file_id, kind_id, value) -- same rationale as
-    write_type_candidates: a retried/re-triggered run re-suggesting a value
-    already written here must be a no-op, not a UNIQUE-constraint crash.
+    Idempotent against (file_id, kind_id, value): a retried/re-triggered run
+    (or augment re-suggesting a value already there) is a no-op, never a
+    UNIQUE-constraint crash. This is also exactly augment's own append-only
+    requirement (docs/workflow/01c-file-label-augment.md) -- confirmed/
+    rejected/suggested rows already in the DB are never touched, since only
+    genuinely-new values reach the INSERT below.
     """
     existing_values = set(
         db.scalars(

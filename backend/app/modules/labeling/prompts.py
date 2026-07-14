@@ -1,4 +1,6 @@
-"""LLM output schemas and prompt templates for label suggestion (initial + augment)."""
+"""LLM output schemas and prompt templates for label suggestion (initial; the
+old single-call flat-schema augment approach is superseded by ADR-0001 D4 f1
+below, which reuses TagValuesOutput)."""
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
@@ -44,47 +46,6 @@ INITIAL_SUGGESTION_PROMPT = ChatPromptTemplate.from_messages(
             "Available catalog labels: {label_names}\n\n"
             "Document excerpt:\n{text}\n\n"
             "Return catalog_picks (from the list above) and free_suggestions (your own additions).",
-        ),
-    ]
-)
-
-
-class AugmentCandidate(BaseModel):
-    name: str = Field(description="A new label name; use lowercase_with_underscores")
-
-
-class AugmentSuggestionOutput(BaseModel):
-    new_labels: list[AugmentCandidate] = Field(
-        default_factory=list,
-        description="New labels that describe this document from a different angle",
-    )
-
-
-AUGMENT_SUGGESTION_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a document classification assistant. "
-            "The user already has labels on this document and wants MORE labels "
-            "from DIFFERENT angles or finer granularity.\n\n"
-            "Rules:\n"
-            "- DO NOT repeat any label from the existing list below.\n"
-            "- DO NOT suggest synonyms or near-synonyms of rejected labels.\n"
-            "- Use the confirmed labels as positive style references "
-            "(the user likes this level of specificity).\n"
-            "- Invent specific, fine-grained labels in lowercase_with_underscores.\n"
-            "- Only suggest labels you are confident about. "
-            "If nothing fits, return an empty list.\n"
-            "- You may pick from the catalog OR invent new names.",
-        ),
-        (
-            "human",
-            "Confirmed labels (user likes these): {confirmed}\n"
-            "Rejected labels (avoid these and synonyms): {rejected}\n"
-            "All existing label names (do NOT repeat): {all_existing}\n\n"
-            "Available catalog labels: {catalog}\n\n"
-            "Document excerpt:\n{text}\n\n"
-            "Return new_labels only — labels NOT in the existing list above.",
         ),
     ]
 )
@@ -154,7 +115,10 @@ INITIAL_KIND_PROMPT = ChatPromptTemplate.from_messages(
 )
 
 
-class InitialTagValuesOutput(BaseModel):
+class TagValuesOutput(BaseModel):
+    """Shared by initial Call 3 and augment's per-kind call -- both just ask
+    for a flat list of values under a kind fixed by the caller's loop."""
+
     values: list[str] = Field(
         default_factory=list,
         description="Every specific value for this tag kind mentioned in the document. Empty list if none appear.",
@@ -168,6 +132,42 @@ INITIAL_TAG_VALUES_PROMPT = ChatPromptTemplate.from_messages(
             "Focus only on the category '{kind_name}'.\n"
             "List every specific '{kind_name}' value mentioned in the document "
             "(e.g. for 'person', list actual names). Return an empty list if none appear.",
+        ),
+    ]
+)
+
+
+# --------------------------------------------------------------------------- #
+# Augment, ADR-0001 D4 f1 (mode=augment): one independent call per tag_kind
+# this file already has values under (which kinds is a DB query, never the
+# LLM -- see ADR-0001 D4 and 01c-file-label-augment.md). Unlike the initial
+# flow's 3 calls, these do NOT share a growing message history with each
+# other -- each kind's gap-filling question is unrelated to any other kind's,
+# so every call gets its own fresh system+human turn (including re-sending
+# the document excerpt, since there is no prior turn to lean on).
+# --------------------------------------------------------------------------- #
+
+AUGMENT_TAG_VALUES_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a document classification assistant. "
+            "The user already reviewed this document's '{kind_name}' values and wants to "
+            "find any that were MISSED the first time.\n\n"
+            "Rules:\n"
+            "- DO NOT repeat any value from the existing list below.\n"
+            "- DO NOT suggest near-synonyms of the rejected values.\n"
+            "- Use the confirmed values as positive style references "
+            "(the user likes this level of specificity).\n"
+            "- Only suggest values you are confident about. If nothing new fits, return an empty list.",
+        ),
+        (
+            "human",
+            "Confirmed '{kind_name}' values (user likes these): {confirmed}\n"
+            "Rejected '{kind_name}' values (avoid these and near-synonyms): {rejected}\n"
+            "All existing '{kind_name}' values (do NOT repeat): {all_existing}\n\n"
+            "Document excerpt:\n{text}\n\n"
+            "Return only NEW '{kind_name}' values not already in the list above.",
         ),
     ]
 )
