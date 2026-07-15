@@ -3,39 +3,39 @@ import logging
 import uuid
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_ollama import ChatOllama
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.modules.labeling.merge import append_augment_candidates, write_initial_candidates
-from app.modules.labeling.models import FileLabel, Label
-from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS
+from app.modules.jobs.models import Job
+from app.modules.jobs.service import mark_progress
+from app.modules.labeling.merge import select_kinds, write_tag_candidates, write_type_candidates
+from app.modules.labeling.models import TagKind, TagLabel, TypeLabelFile
 from app.modules.labeling.prompts import (
-    AUGMENT_SUGGESTION_PROMPT,
-    AugmentSuggestionOutput,
-    INITIAL_SUGGESTION_PROMPT,
-    LabelSuggestionOutput,
+    AUGMENT_TAG_VALUES_PROMPT,
+    INITIAL_KIND_PROMPT,
+    INITIAL_TAG_VALUES_PROMPT,
+    INITIAL_TYPE_PROMPT,
+    InitialKindSuggestionOutput,
+    InitialTypeSuggestionOutput,
+    TagValuesOutput,
 )
+from app.modules.labeling.service import ensure_tag_kind_catalog, ensure_type_catalog
 from app.modules.rag.models import FileChunk
 from app.shared.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ~1-2 pages (rag/service.py CHUNK_SIZE=1000 chars/chunk): classifying type/
+# kinds/tags doesn't need the full document (see 01b-file-label-initial.md).
+# Reused by augment (01c): "same as initial, only read the first few chunks".
+INITIAL_LABEL_MAX_CHUNKS = 5
 
-def _ensure_label_catalog(db: Session) -> list[Label]:
-    """Return all labels in the catalog; auto-populate from presets if empty."""
-    labels = list(db.scalars(select(Label)))
-    if labels:
-        return labels
-
-    logger.info("suggest_labels: label catalog is empty — auto-populating from presets")
-    all_preset_names = list(RECOMMENDED_LABELS) + list(OPTIONAL_LABELS)
-    new_labels = [Label(name=name) for name in all_preset_names]
-    db.add_all(new_labels)
-    db.commit()
-    for lbl in new_labels:
-        db.refresh(lbl)
-    return new_labels
+# >0 on purpose (ADR-0001 D4 f1 / 01c): augment's whole point is finding
+# values Call 3 missed the first time; temperature=0 tends to rediscover the
+# same values. Exact value TBD by real runs against qwen2.5:3b.
+AUGMENT_TEMPERATURE = 0.7
 
 
 def _invoke_or_raise(structured_llm, messages, *, file_id: uuid.UUID):
@@ -61,92 +61,100 @@ def _invoke_or_raise(structured_llm, messages, *, file_id: uuid.UUID):
         raise
 
 
-def _load_chunks_and_llm(
+def suggest_labels(
     db: Session,
     file_id: uuid.UUID,
+    job: Job,
     *,
-    llm: BaseChatModel | None,
-    max_chunks: int | None,
-) -> tuple[list[Label], list[FileChunk], BaseChatModel]:
-    """Shared scaffolding for suggest_labels / suggest_labels_augment.
+    llm: BaseChatModel | None = None,
+    max_chunks: int | None = INITIAL_LABEL_MAX_CHUNKS,
+) -> tuple[list[TypeLabelFile], list[TagLabel]]:
+    """Three-stage initial labeling (ADR-0001 D3, mode=initial): type -> kinds -> per-kind tags.
 
-    Ensures the label catalog exists, loads this file's chunks (ordered,
-    capped to max_chunks), and resolves a default Ollama client if none was
-    injected. Returns an empty chunks list when the file has no chunks yet --
-    callers check for that themselves since the "no chunks" log message
-    differs between initial and augment mode.
+    One ChatOllama instance, one growing `messages` list: each call appends
+    its own turn before the next runs, so later calls see earlier ones
+    (conversation memory) without re-sending the document text every time.
+    `job.stage` advances type -> kinds -> tags as the caller (run_label)
+    already set it to "type" and called mark_running before this runs.
+
+    Each stage writes AND commits immediately (write_type_candidates /
+    write_tag_candidates) rather than just flushing: a mid-flow failure
+    (e.g. Call 2, or a later Call-3 iteration) must leave earlier stages'
+    suggestions in place, not roll them back — see
+    docs/workflow/01b-file-label-initial.md.
+
+    No confidence scoring (see ADR-0001 D2) -- everything lands as
+    status=suggested; quality control is the user's confirm/reject action.
+
+    Error handling (fail-loud): any LLM/parse error is logged and re-raised
+    by _invoke_or_raise; run_label marks the job failed and records
+    error_message on it.
     """
-    labels = _ensure_label_catalog(db)
+    types = ensure_type_catalog(db)
+    kinds = ensure_tag_kind_catalog(db)
 
-    all_chunks = list(
-        db.scalars(
-            select(FileChunk)
-            .where(FileChunk.file_id == file_id)
-            .order_by(FileChunk.chunk_index)
-        )
-    )
-    chunks = all_chunks if max_chunks is None else all_chunks[:max_chunks]
+    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
+    if max_chunks is not None:
+        chunk_query = chunk_query.limit(max_chunks)
+    chunks = list(db.scalars(chunk_query))
+    if not chunks:
+        logger.warning("suggest_labels: no chunks found for file %s", file_id)
+        return [], []
 
     if llm is None:
         llm = ChatOllama(
             model=settings.ollama_model,
             base_url=settings.ollama_base_url,
             temperature=0,
+            num_ctx=settings.ollama_num_ctx,
         )
 
-    return labels, chunks, llm
+    text = "\n\n".join(c.content for c in chunks)
+    messages: list[BaseMessage] = []
 
-
-def suggest_labels(
-    db: Session,
-    file_id: uuid.UUID,
-    *,
-    llm: BaseChatModel | None = None,
-    max_chunks: int | None = None,
-) -> list[FileLabel]:
-    """Call the LLM to suggest labels for a file, then persist file_labels rows.
-
-    Two output paths:
-    - catalog_picks: LLM selects from the existing Label catalog → FileLabel with label_id set
-    - free_suggestions: LLM invents finer-grained names → FileLabel with label_name set, label_id NULL
-
-    If the label catalog is empty, all presets are auto-inserted before calling the LLM.
-
-    No confidence scoring happens anywhere in this pipeline (see ADR-0001 D2) --
-    every suggestion the LLM returns is stored as "suggested"; quality control
-    is entirely the user's confirm/reject action, not a model-reported score.
-
-    The LLM client is injectable so tests can pass a mock without hitting Ollama.
-
-    Error handling (fail-loud):
-    - Any LLM/parse error → logged and re-raised. run_label marks the job failed
-      and records error_message; RQ retries transient failures (e.g. Ollama down).
-      We do NOT swallow: a label job that produced nothing must look failed, not
-      succeeded. Labeling is its own job, so failing it never undoes ingest/embed.
-    """
-    labels, chunks, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks)
-    if not chunks:
-        logger.warning("suggest_labels: no chunks found for file %s", file_id)
-        return []
-
-    structured_llm = llm.with_structured_output(LabelSuggestionOutput)
-    messages = INITIAL_SUGGESTION_PROMPT.format_messages(
-        label_names=", ".join(lbl.name for lbl in labels),
-        text="\n\n".join(c.content for c in chunks),
+    # --- Call 1 (stage=type, set by run_label before calling this) ---
+    type_llm = llm.with_structured_output(InitialTypeSuggestionOutput)
+    messages.extend(
+        INITIAL_TYPE_PROMPT.format_messages(type_names=", ".join(t.name for t in types), text=text)
     )
+    type_output: InitialTypeSuggestionOutput = _invoke_or_raise(type_llm, messages, file_id=file_id)
+    messages.append(AIMessage(content=type_output.model_dump_json()))
 
-    output: LabelSuggestionOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
+    type_label_files = write_type_candidates(db, file_id, type_output, types)
 
-    file_labels = write_initial_candidates(db, file_id, output, labels)
+    # --- Call 2 (stage=kinds) ---
+    job.stage = "kinds"
+    mark_progress(db, job)
+
+    kind_llm = llm.with_structured_output(InitialKindSuggestionOutput)
+    messages.extend(INITIAL_KIND_PROMPT.format_messages(kind_names=", ".join(k.name for k in kinds)))
+    kind_output: InitialKindSuggestionOutput = _invoke_or_raise(kind_llm, messages, file_id=file_id)
+    messages.append(AIMessage(content=kind_output.model_dump_json()))
+
+    chosen_kinds = select_kinds(kind_output, kinds)
+
+    # --- Call 3 x N (stage=tags): one focused call per chosen kind ---
+    job.stage = "tags"
+    mark_progress(db, job)
+
+    tag_labels: list[TagLabel] = []
+    tag_llm = llm.with_structured_output(TagValuesOutput)
+    for kind in chosen_kinds:
+        messages.extend(INITIAL_TAG_VALUES_PROMPT.format_messages(kind_name=kind.name))
+        tag_output: TagValuesOutput = _invoke_or_raise(tag_llm, messages, file_id=file_id)
+        messages.append(AIMessage(content=tag_output.model_dump_json()))
+
+        tag_labels.extend(write_tag_candidates(db, file_id, kind, tag_output))
 
     logger.info(
-        "suggest_labels: file %s → %d catalog picks, %d free-text suggestions",
+        "suggest_labels: file %s → %d type picks, %d tag values across %d kinds",
         file_id,
-        len([f for f in file_labels if f.label_id is not None]),
-        len([f for f in file_labels if f.label_id is None]),
+        len(type_label_files),
+        len(tag_labels),
+        len(chosen_kinds),
     )
 
-    return file_labels
+    return type_label_files, tag_labels
 
 
 def suggest_labels_augment(
@@ -154,35 +162,87 @@ def suggest_labels_augment(
     file_id: uuid.UUID,
     *,
     llm: BaseChatModel | None = None,
-    max_chunks: int | None = None,
-) -> list[FileLabel]:
-    """Augment prompt: suggest NEW labels for a file that already has labels."""
-    labels, chunks, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks)
+    max_chunks: int | None = INITIAL_LABEL_MAX_CHUNKS,
+    temperature: float = AUGMENT_TEMPERATURE,
+) -> list[TagLabel]:
+    """Augment (ADR-0001 D4 f1, mode=augment): for each tag_kind this file
+    already has values under, ask once more whether anything was missed.
+
+    Which kinds to ask about is a DB query -- the distinct kind_id already
+    present in this file's tag_labels -- never an LLM decision, so there is
+    structurally no code path here that could write type_labels_files.
+
+    Unlike suggest_labels's 3 calls, these per-kind calls do NOT share a
+    growing message history with each other: each kind's gap-filling
+    question is independent of any other kind's, so every call gets its own
+    fresh system+human turn (re-sending the document excerpt each time,
+    since there's no prior turn to lean on). jobs.stage stays "tags"
+    throughout (no type/kinds stages) -- set by run_label before this runs.
+
+    Append-only (see write_tag_candidates): existing confirmed/rejected/
+    suggested rows are never touched, only genuinely new values are
+    inserted. Each kind's call writes and commits immediately, so one
+    kind's failure doesn't undo another's already-written values.
+
+    temperature is injectable and defaults > 0: f1 is explicitly
+    exploratory (finding what Call 3 missed), and temperature=0 tends to
+    rediscover the same values as last time -- the accuracy/hallucination
+    trade-off is a deliberate one (see docs/workflow/01c).
+    """
+    existing_tags = list(db.scalars(select(TagLabel).where(TagLabel.file_id == file_id)))
+    kind_ids = {t.kind_id for t in existing_tags}
+    if not kind_ids:
+        logger.info("suggest_labels_augment: file %s has no existing tag_labels to augment", file_id)
+        return []
+    # Ordered by name: IN (...) doesn't guarantee row order, and each kind's
+    # call is independent (no shared history), so a stable, predictable
+    # iteration order matters for logs/debugging even though it's otherwise
+    # not behaviorally significant.
+    kinds = list(db.scalars(select(TagKind).where(TagKind.id.in_(kind_ids)).order_by(TagKind.name)))
+
+    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
+    if max_chunks is not None:
+        chunk_query = chunk_query.limit(max_chunks)
+    chunks = list(db.scalars(chunk_query))
     if not chunks:
         logger.warning("suggest_labels_augment: no chunks for file %s", file_id)
         return []
 
-    existing = list(db.scalars(select(FileLabel).where(FileLabel.file_id == file_id)))
-    confirmed = [fl.label_name for fl in existing if fl.status == "confirmed"]
-    rejected = [fl.label_name for fl in existing if fl.status == "rejected"]
-    all_existing = [fl.label_name for fl in existing]
+    if llm is None:
+        llm = ChatOllama(
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            temperature=temperature,
+            num_ctx=settings.ollama_num_ctx,
+        )
 
-    structured_llm = llm.with_structured_output(AugmentSuggestionOutput)
-    messages = AUGMENT_SUGGESTION_PROMPT.format_messages(
-        confirmed=", ".join(confirmed) or "(none)",
-        rejected=", ".join(rejected) or "(none)",
-        all_existing=", ".join(all_existing) or "(none)",
-        catalog=", ".join(lbl.name for lbl in labels),
-        text="\n\n".join(c.content for c in chunks),
-    )
+    text = "\n\n".join(c.content for c in chunks)
+    structured_llm = llm.with_structured_output(TagValuesOutput)
 
-    output: AugmentSuggestionOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
+    tag_labels: list[TagLabel] = []
+    for kind in kinds:
+        kind_tags = [t for t in existing_tags if t.kind_id == kind.id]
+        confirmed = [t.value for t in kind_tags if t.status == "confirmed"]
+        rejected = [t.value for t in kind_tags if t.status == "rejected"]
+        all_existing = [t.value for t in kind_tags]
 
-    file_labels = append_augment_candidates(db, file_id, output, labels)
+        messages = AUGMENT_TAG_VALUES_PROMPT.format_messages(
+            kind_name=kind.name,
+            confirmed=", ".join(confirmed) or "(none)",
+            rejected=", ".join(rejected) or "(none)",
+            all_existing=", ".join(all_existing) or "(none)",
+            text=text,
+        )
+        output: TagValuesOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
+
+        tag_labels.extend(
+            write_tag_candidates(db, file_id, kind, output, existing_values=set(all_existing))
+        )
 
     logger.info(
-        "suggest_labels_augment: file %s → %d new labels appended",
+        "suggest_labels_augment: file %s → %d new tag values across %d existing kinds",
         file_id,
-        len(file_labels),
+        len(tag_labels),
+        len(kinds),
     )
-    return file_labels
+    return tag_labels

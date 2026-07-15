@@ -21,6 +21,12 @@ from app.shared.database import Base
 # on purpose -- adding a new mode is a one-line change here, not a migration.
 VALID_JOB_MODES = frozenset({"default", "initial", "augment", "check"})
 
+# Per-type stage progression (see docs/03_er-diagram.md): ingest is
+# extract|clean|chunk; label/mode=initial is type|kinds|tags; label/
+# mode=augment only ever reaches tags; scan/embed leave stage NULL. Same
+# app-layer-guard rationale as VALID_JOB_MODES.
+VALID_JOB_STAGES = frozenset({"extract", "clean", "chunk", "type", "kinds", "tags"})
+
 
 class Job(Base):
     __tablename__ = "jobs"
@@ -72,4 +78,10 @@ class Job(Base):
     def _validate_mode(self, _key: str, value: str) -> str:
         if value not in VALID_JOB_MODES:
             raise ValueError(f"Invalid job mode {value!r}; expected one of {sorted(VALID_JOB_MODES)}")
+        return value
+
+    @validates("stage")
+    def _validate_stage(self, _key: str, value: str | None) -> str | None:
+        if value is not None and value not in VALID_JOB_STAGES:
+            raise ValueError(f"Invalid job stage {value!r}; expected None or one of {sorted(VALID_JOB_STAGES)}")
         return value

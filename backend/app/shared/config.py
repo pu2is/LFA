@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:3b"
     ollama_embed_model: str = "bge-m3"
+    # Wider than Ollama's runtime default (2048-4096): the 3-stage initial
+    # labeling flow (ADR-0001 D3) accumulates conversation history across
+    # calls, which can otherwise get silently truncated mid-flow.
+    ollama_num_ctx: int = 8192
 
     model_config = SettingsConfigDict(
         env_file=".env",
