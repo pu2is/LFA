@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.main import app
 from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
+from app.modules.labeling import service
 from app.modules.labeling.models import TagKind, TagLabel
 from app.shared.database import get_db
 from app.shared.queue import JOB_RETRY
@@ -75,18 +76,25 @@ def path_with_mixed_files(db: Session):
     yield path, ready, discovered
 
 
+_LABELED_FAKE_PATH = "D:/lfa_test_label_routes_labeled"
+
+
 @pytest.fixture
 def ready_file_with_labels(db: Session):
     """A ready file that already has tag_labels — triggers augment mode
-    (service.file_has_type_or_tag_labels)."""
-    path = RegisteredPath(path=_FAKE_PATH)
+    (service.get_files_with_type_or_tag_labels).
+
+    Uses its own path constant (distinct from _FAKE_PATH/path_and_ready_file)
+    so a test can request both fixtures together without a paths.path unique
+    violation (see test_label_files_batch_assigns_mode_per_file_not_bulk)."""
+    path = RegisteredPath(path=_LABELED_FAKE_PATH)
     db.add(path)
     db.flush()
 
     file = File(
         path_id=path.id,
         filename="labeled.pdf",
-        full_path=f"{_FAKE_PATH}/labeled.pdf",
+        full_path=f"{_LABELED_FAKE_PATH}/labeled.pdf",
         file_type="pdf",
         file_size=2048,
         file_hash="cafebabe" * 8,
@@ -199,6 +207,60 @@ def test_label_files_augment_for_labeled_file(mock_q, client, ready_file_with_la
     data = resp.json()
     assert len(data["enqueued"]) == 1
     assert data["enqueued"][0]["mode"] == "augment"
+
+
+@patch("app.modules.labeling.routes.label_queue")
+def test_label_files_batch_assigns_mode_per_file_not_bulk(mock_q, client, ready_file_with_labels, path_and_ready_file):
+    """One batched existence check must not smear "labeled" across the
+    whole request -- each file's mode reflects only its own rows (#47 review:
+    file_has_type_or_tag_labels became a batched get_files_with_type_or_tag_labels)."""
+    _, labeled_file = ready_file_with_labels
+    _, unlabeled_file = path_and_ready_file
+    mock_q.enqueue.side_effect = [mock_rq_job(), mock_rq_job()]
+
+    resp = client.post("/label/files", json={"file_ids": [str(labeled_file.id), str(unlabeled_file.id)]})
+
+    assert resp.status_code == 202
+    mode_by_file = {e["file_id"]: e["mode"] for e in resp.json()["enqueued"]}
+    assert mode_by_file[str(labeled_file.id)] == "augment"
+    assert mode_by_file[str(unlabeled_file.id)] == "initial"
+
+
+# ---------------------------------------------------------------------------
+# service.get_files_with_type_or_tag_labels — batched routing check
+# ---------------------------------------------------------------------------
+
+def test_get_files_with_type_or_tag_labels_returns_only_labeled_files(db: Session):
+    path = RegisteredPath(path=_FAKE_PATH)
+    db.add(path)
+    db.flush()
+
+    tagged = File(
+        path_id=path.id, filename="tagged.pdf", full_path=f"{_FAKE_PATH}/tagged.pdf",
+        file_type="pdf", file_size=100, file_hash="gftl-tagged" * 4,
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    untagged = File(
+        path_id=path.id, filename="untagged.pdf", full_path=f"{_FAKE_PATH}/untagged.pdf",
+        file_type="pdf", file_size=100, file_hash="gftl-untagged" * 4,
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add_all([tagged, untagged])
+    db.flush()
+
+    kind = TagKind(name="gftl_test_person")
+    db.add(kind)
+    db.flush()
+    db.add(TagLabel(file_id=tagged.id, kind_id=kind.id, value="Angela Merkel", source="llm", status="confirmed"))
+    db.commit()
+
+    result = service.get_files_with_type_or_tag_labels(db, [tagged.id, untagged.id])
+
+    assert result == {tagged.id}
+
+
+def test_get_files_with_type_or_tag_labels_empty_input_returns_empty_set(db: Session):
+    assert service.get_files_with_type_or_tag_labels(db, []) == set()
 
 
 # ---------------------------------------------------------------------------

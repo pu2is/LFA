@@ -262,7 +262,7 @@ def test_suggest_labels_advances_stage_through_kinds_and_tags(db, file_and_job, 
 def test_suggest_labels_rerun_on_same_file_is_idempotent_not_a_crash(db, file_and_job, seeded_catalogs):
     """RQ retries reuse the same job row (#33). Once this file has ANY
     type_labels_files/tag_labels row, /label routes it to mode=augment (see
-    service.file_has_type_or_tag_labels) instead of calling suggest_labels
+    service.get_files_with_type_or_tag_labels) instead of calling suggest_labels
     again -- but suggest_labels itself must still be safe to call twice
     directly (e.g. a retry mid-run, before any row exists yet): running it
     twice with overlapping LLM output must not hit the (file_id,

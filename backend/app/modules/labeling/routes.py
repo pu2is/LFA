@@ -37,6 +37,26 @@ def _require_file(db: Session, file_id: uuid.UUID) -> None:
     if db.get(File, file_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
+
+def _delete_catalog_entry_or_409(db: Session, delete_fn, entry, label: str) -> None:
+    """Shared body for the type-labels/tag-kinds catalog DELETE routes:
+    run delete_fn, translating the FK-violation IntegrityError (entry still
+    attached to files) into a 409 instead of an unhandled 500. Only safe
+    because each catalog table has exactly one inbound FK today (models.py);
+    revisit if either table ever gains a second one, since this would then
+    also catch -- and misreport as "still referenced" -- an unrelated
+    constraint violation on the same delete.
+    """
+    try:
+        delete_fn(db, entry)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{label} is still referenced by one or more files",
+        )
+
+
 router = APIRouter(tags=["labels"])
 
 
@@ -59,13 +79,16 @@ def _enqueue_label_jobs(
     enqueued: list[LabelJobEnqueued] = []
     skipped: list[LabelJobSkipped] = []
 
+    # One batched pair of queries for the whole request instead of one pair
+    # per file -- see #47 code review.
+    labeled_file_ids = service.get_files_with_type_or_tag_labels(db, [f.id for f in files])
+
     for file in files:
         if file.status != "ready":
             skipped.append(LabelJobSkipped(file_id=file.id, reason=f"status is '{file.status}', not 'ready'"))
             continue
 
-        has_labels = service.file_has_type_or_tag_labels(db, file.id)
-        mode = "augment" if has_labels else "initial"
+        mode = "augment" if file.id in labeled_file_ids else "initial"
 
         job = Job(type="label", file_id=file.id, trigger="manual", mode=mode)
         db.add(job)
@@ -143,14 +166,7 @@ def remove_type_label(type_label_id: uuid.UUID, db: Session = Depends(get_db)) -
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Type label not found")
 
     deleted = TypeLabelRead.model_validate(type_label)
-    try:
-        service.delete_type_label(db, type_label)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Type label is still referenced by one or more files",
-        )
+    _delete_catalog_entry_or_409(db, service.delete_type_label, type_label, "Type label")
     return deleted
 
 
@@ -174,14 +190,7 @@ def remove_tag_kind(tag_kind_id: uuid.UUID, db: Session = Depends(get_db)) -> Ta
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag kind not found")
 
     deleted = TagKindRead.model_validate(tag_kind)
-    try:
-        service.delete_tag_kind(db, tag_kind)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Tag kind is still referenced by one or more files",
-        )
+    _delete_catalog_entry_or_409(db, service.delete_tag_kind, tag_kind, "Tag kind")
     return deleted
 
 

@@ -93,14 +93,10 @@ def suggest_labels(
     types = ensure_type_catalog(db)
     kinds = ensure_tag_kind_catalog(db)
 
-    all_chunks = list(
-        db.scalars(
-            select(FileChunk)
-            .where(FileChunk.file_id == file_id)
-            .order_by(FileChunk.chunk_index)
-        )
-    )
-    chunks = all_chunks if max_chunks is None else all_chunks[:max_chunks]
+    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
+    if max_chunks is not None:
+        chunk_query = chunk_query.limit(max_chunks)
+    chunks = list(db.scalars(chunk_query))
     if not chunks:
         logger.warning("suggest_labels: no chunks found for file %s", file_id)
         return [], []
@@ -204,14 +200,10 @@ def suggest_labels_augment(
     # not behaviorally significant.
     kinds = list(db.scalars(select(TagKind).where(TagKind.id.in_(kind_ids)).order_by(TagKind.name)))
 
-    all_chunks = list(
-        db.scalars(
-            select(FileChunk)
-            .where(FileChunk.file_id == file_id)
-            .order_by(FileChunk.chunk_index)
-        )
-    )
-    chunks = all_chunks if max_chunks is None else all_chunks[:max_chunks]
+    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
+    if max_chunks is not None:
+        chunk_query = chunk_query.limit(max_chunks)
+    chunks = list(db.scalars(chunk_query))
     if not chunks:
         logger.warning("suggest_labels_augment: no chunks for file %s", file_id)
         return []
@@ -243,7 +235,9 @@ def suggest_labels_augment(
         )
         output: TagValuesOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
 
-        tag_labels.extend(write_tag_candidates(db, file_id, kind, output))
+        tag_labels.extend(
+            write_tag_candidates(db, file_id, kind, output, existing_values=set(all_existing))
+        )
 
     logger.info(
         "suggest_labels_augment: file %s → %d new tag values across %d existing kinds",

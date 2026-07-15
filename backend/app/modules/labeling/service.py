@@ -44,16 +44,19 @@ def ensure_tag_kind_catalog(db: Session) -> list[TagKind]:
     return new_kinds
 
 
-def file_has_type_or_tag_labels(db: Session, file_id: uuid.UUID) -> bool:
-    """Whether this file has any type_labels_files or tag_labels rows yet.
+def get_files_with_type_or_tag_labels(db: Session, file_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of these file_ids have any type_labels_files or tag_labels rows yet.
 
     Drives /label's initial-vs-augment routing (docs/workflow/01c-file-label-
-    augment.md): none yet -> mode=initial; any -> mode=augment.
+    augment.md): none yet -> mode=initial; any -> mode=augment. Batched (2
+    queries for the whole list) rather than per-file, since callers route a
+    whole batch of files at once (POST /label/files|paths).
     """
-    return (
-        db.scalar(select(TypeLabelFile.id).where(TypeLabelFile.file_id == file_id).limit(1)) is not None
-        or db.scalar(select(TagLabel.id).where(TagLabel.file_id == file_id).limit(1)) is not None
-    )
+    if not file_ids:
+        return set()
+    typed = set(db.scalars(select(TypeLabelFile.file_id).where(TypeLabelFile.file_id.in_(file_ids))))
+    tagged = set(db.scalars(select(TagLabel.file_id).where(TagLabel.file_id.in_(file_ids))))
+    return typed | tagged
 
 
 # --------------------------------------------------------------------------- #

@@ -83,6 +83,8 @@ def write_tag_candidates(
     file_id: uuid.UUID,
     kind: TagKind,
     output: TagValuesOutput,
+    *,
+    existing_values: set[str] | None = None,
 ) -> list[TagLabel]:
     """Write one kind's worth of tag values to tag_labels -- shared by initial
     Call 3 and augment's per-kind call, since both are "insert new values
@@ -98,12 +100,18 @@ def write_tag_candidates(
     requirement (docs/workflow/01c-file-label-augment.md) -- confirmed/
     rejected/suggested rows already in the DB are never touched, since only
     genuinely-new values reach the INSERT below.
+
+    existing_values: pass this (file, kind)'s current values if the caller
+    already has them loaded (augment does, from its own upfront query) to
+    skip the redundant re-query; omitted (initial's Call 3, which has no
+    prior read of tag_labels) queries them here.
     """
-    existing_values = set(
-        db.scalars(
-            select(TagLabel.value).where(TagLabel.file_id == file_id, TagLabel.kind_id == kind.id)
+    if existing_values is None:
+        existing_values = set(
+            db.scalars(
+                select(TagLabel.value).where(TagLabel.file_id == file_id, TagLabel.kind_id == kind.id)
+            )
         )
-    )
     rows: list[TagLabel] = []
     seen: set[str] = set()
 
