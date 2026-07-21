@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
-from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS, TAG_KIND_PRESETS
+from app.modules.labeling.presets import TAG_KIND_PRESETS, TYPE_LABEL_PRESETS
 
 
 def normalize_label_name(raw: str) -> str:
@@ -21,8 +21,7 @@ def ensure_type_catalog(db: Session) -> list[TypeLabel]:
     if types:
         return types
 
-    all_preset_names = list(RECOMMENDED_LABELS) + list(OPTIONAL_LABELS)
-    new_types = [TypeLabel(name=name) for name in all_preset_names]
+    new_types = [TypeLabel(name=name) for name in TYPE_LABEL_PRESETS]
     db.add_all(new_types)
     db.commit()
     for t in new_types:
@@ -155,10 +154,13 @@ def batch_patch_type_labels_files(
     All-or-nothing: raises ValueError listing any IDs not found or not belonging
     to this file so the caller can return a 404 before touching the DB.
     """
+    ids = [row_id for row_id, _ in operations]
+    rows_by_id = {row.id: row for row in db.scalars(select(TypeLabelFile).where(TypeLabelFile.id.in_(ids)))}
+
     to_update: list[tuple[TypeLabelFile, str]] = []
     missing: list[str] = []
     for row_id, action in operations:
-        row = get_type_labels_file_by_id(db, row_id)
+        row = rows_by_id.get(row_id)
         if row is None or row.file_id != file_id:
             missing.append(str(row_id))
         else:
@@ -228,10 +230,13 @@ def batch_patch_tag_labels(
     All-or-nothing: raises ValueError listing any IDs not found or not belonging
     to this file so the caller can return a 404 before touching the DB.
     """
+    ids = [row_id for row_id, _ in operations]
+    rows_by_id = {row.id: row for row in db.scalars(select(TagLabel).where(TagLabel.id.in_(ids)))}
+
     to_update: list[tuple[TagLabel, str]] = []
     missing: list[str] = []
     for row_id, action in operations:
-        row = get_tag_label_by_id(db, row_id)
+        row = rows_by_id.get(row_id)
         if row is None or row.file_id != file_id:
             missing.append(str(row_id))
         else:

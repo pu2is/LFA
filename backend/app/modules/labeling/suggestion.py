@@ -61,6 +61,34 @@ def _invoke_or_raise(structured_llm, messages, *, file_id: uuid.UUID):
         raise
 
 
+def _load_chunks_and_llm(
+    db: Session,
+    file_id: uuid.UUID,
+    *,
+    llm: BaseChatModel | None,
+    max_chunks: int | None,
+    temperature: float,
+) -> tuple[list[FileChunk], BaseChatModel | None]:
+    """Shared by suggest_labels/suggest_labels_augment: load this file's
+    chunks (capped at max_chunks) and lazily build the ChatOllama instance
+    if the caller didn't inject one. Returns an empty chunk list, not an
+    exception, when the file has no chunks -- callers decide what that means.
+    """
+    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
+    if max_chunks is not None:
+        chunk_query = chunk_query.limit(max_chunks)
+    chunks = list(db.scalars(chunk_query))
+
+    if chunks and llm is None:
+        llm = ChatOllama(
+            model=settings.ollama_model,
+            base_url=settings.ollama_base_url,
+            temperature=temperature,
+            num_ctx=settings.ollama_num_ctx,
+        )
+    return chunks, llm
+
+
 def suggest_labels(
     db: Session,
     file_id: uuid.UUID,
@@ -93,21 +121,10 @@ def suggest_labels(
     types = ensure_type_catalog(db)
     kinds = ensure_tag_kind_catalog(db)
 
-    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
-    if max_chunks is not None:
-        chunk_query = chunk_query.limit(max_chunks)
-    chunks = list(db.scalars(chunk_query))
+    chunks, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks, temperature=0)
     if not chunks:
         logger.warning("suggest_labels: no chunks found for file %s", file_id)
         return [], []
-
-    if llm is None:
-        llm = ChatOllama(
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
-            temperature=0,
-            num_ctx=settings.ollama_num_ctx,
-        )
 
     text = "\n\n".join(c.content for c in chunks)
     messages: list[BaseMessage] = []
@@ -137,6 +154,13 @@ def suggest_labels(
     job.stage = "tags"
     mark_progress(db, job)
 
+    # One upfront query for the whole file instead of one per kind inside
+    # the loop -- see #47 code review. Mirrors suggest_labels_augment, which
+    # already loads existing tags once and slices by kind_id.
+    existing_by_kind: dict[uuid.UUID, set[str]] = {}
+    for value, kind_id in db.execute(select(TagLabel.value, TagLabel.kind_id).where(TagLabel.file_id == file_id)):
+        existing_by_kind.setdefault(kind_id, set()).add(value)
+
     tag_labels: list[TagLabel] = []
     tag_llm = llm.with_structured_output(TagValuesOutput)
     for kind in chosen_kinds:
@@ -144,7 +168,11 @@ def suggest_labels(
         tag_output: TagValuesOutput = _invoke_or_raise(tag_llm, messages, file_id=file_id)
         messages.append(AIMessage(content=tag_output.model_dump_json()))
 
-        tag_labels.extend(write_tag_candidates(db, file_id, kind, tag_output))
+        tag_labels.extend(
+            write_tag_candidates(
+                db, file_id, kind, tag_output, existing_values=existing_by_kind.get(kind.id, set())
+            )
+        )
 
     logger.info(
         "suggest_labels: file %s → %d type picks, %d tag values across %d kinds",
@@ -200,21 +228,10 @@ def suggest_labels_augment(
     # not behaviorally significant.
     kinds = list(db.scalars(select(TagKind).where(TagKind.id.in_(kind_ids)).order_by(TagKind.name)))
 
-    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
-    if max_chunks is not None:
-        chunk_query = chunk_query.limit(max_chunks)
-    chunks = list(db.scalars(chunk_query))
+    chunks, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks, temperature=temperature)
     if not chunks:
         logger.warning("suggest_labels_augment: no chunks for file %s", file_id)
         return []
-
-    if llm is None:
-        llm = ChatOllama(
-            model=settings.ollama_model,
-            base_url=settings.ollama_base_url,
-            temperature=temperature,
-            num_ctx=settings.ollama_num_ctx,
-        )
 
     text = "\n\n".join(c.content for c in chunks)
     structured_llm = llm.with_structured_output(TagValuesOutput)
