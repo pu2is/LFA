@@ -7,7 +7,7 @@ untouched (no merge/backfill of missing presets).
 from sqlalchemy import select
 
 from app.modules.labeling.models import TagKind, TypeLabel
-from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS, TAG_KIND_PRESETS
+from app.modules.labeling.presets import TAG_KIND_PRESETS, TYPE_LABEL_PRESETS
 from app.modules.labeling.service import ensure_tag_kind_catalog, ensure_type_catalog
 
 
@@ -20,8 +20,8 @@ def test_ensure_type_catalog_seeds_all_presets_when_empty(db):
 
     types = ensure_type_catalog(db)
 
-    assert {t.name for t in types} == set(RECOMMENDED_LABELS) | set(OPTIONAL_LABELS)
-    assert len(types) == len(RECOMMENDED_LABELS) + len(OPTIONAL_LABELS)
+    assert {t.name for t in types} == set(TYPE_LABEL_PRESETS)
+    assert len(types) == len(TYPE_LABEL_PRESETS)
 
 
 def test_ensure_type_catalog_is_idempotent(db):

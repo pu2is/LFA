@@ -5,7 +5,7 @@ stores what the user actually selected. Changing the catalog is a code
 change, not a migration.
 """
 
-RECOMMENDED_LABELS: tuple[str, ...] = (
+TYPE_LABEL_PRESETS: tuple[str, ...] = (
     "invoice",
     "contract",
     "report",
@@ -16,9 +16,6 @@ RECOMMENDED_LABELS: tuple[str, ...] = (
     "manual",
     "correspondence",
     "other",
-)
-
-OPTIONAL_LABELS: tuple[str, ...] = (
     "bank_statement",
     "payslip",
     "utility_bill",
