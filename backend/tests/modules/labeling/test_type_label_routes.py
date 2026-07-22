@@ -128,10 +128,33 @@ def test_add_user_type_label_unknown_type_404(client, file_id):
     assert resp.status_code == 404
 
 
-def test_add_user_type_label_duplicate_409(client, file_id, type_label):
-    client.post(f"/files/{file_id}/type-labels", json={"type_label_id": str(type_label.id)})
+def test_add_user_type_label_duplicate_is_idempotent_200(client, db, file_id, type_label):
+    """#50: a repeat manual add is not an error -- it's a no-op confirm."""
+    first = client.post(f"/files/{file_id}/type-labels", json={"type_label_id": str(type_label.id)})
+    assert first.status_code == 201
+
     resp = client.post(f"/files/{file_id}/type-labels", json={"type_label_id": str(type_label.id)})
-    assert resp.status_code == 409
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == first.json()["id"]  # same row, not a new one
+    assert len(list(db.scalars(select(TypeLabelFile).where(TypeLabelFile.file_id == file_id)))) == 1
+
+
+def test_add_user_type_label_flips_rejected_to_confirmed_200(client, db, file_id, type_label):
+    """#50: the dead end -- LLM suggested, user rejected, user manually re-adds
+    -- must now succeed (200), not 409 with no way forward."""
+    rejected = TypeLabelFile(file_id=file_id, type_label_id=type_label.id, source="llm", status="rejected")
+    db.add(rejected)
+    db.commit()
+    db.refresh(rejected)
+
+    resp = client.post(f"/files/{file_id}/type-labels", json={"type_label_id": str(type_label.id)})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == str(rejected.id)
+    assert data["status"] == "confirmed"
+    assert data["source"] == "llm"  # provenance untouched -- only status flips
 
 
 def test_patch_confirms_suggested_type_label(client, db, file_id, type_label):

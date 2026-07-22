@@ -1,6 +1,7 @@
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, literal_column, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
@@ -132,18 +133,6 @@ def get_type_labels_file_by_id(db: Session, type_label_file_id: uuid.UUID) -> Ty
     return db.get(TypeLabelFile, type_label_file_id)
 
 
-def get_type_labels_file_by_catalog(
-    db: Session, file_id: uuid.UUID, type_label_id: uuid.UUID
-) -> TypeLabelFile | None:
-    """Fetch a (file_id, type_label_id) row. Used for duplicate checks on manual add."""
-    return db.scalar(
-        select(TypeLabelFile).where(
-            TypeLabelFile.file_id == file_id,
-            TypeLabelFile.type_label_id == type_label_id,
-        )
-    )
-
-
 def batch_patch_type_labels_files(
     db: Session,
     file_id: uuid.UUID,
@@ -177,17 +166,42 @@ def batch_patch_type_labels_files(
     return [row for row, _ in to_update]
 
 
-def add_user_type_label(db: Session, file_id: uuid.UUID, type_label: TypeLabel) -> TypeLabelFile:
-    row = TypeLabelFile(
-        file_id=file_id,
-        type_label_id=type_label.id,
-        source="user",
-        status="confirmed",
+def upsert_user_type_label(
+    db: Session, file_id: uuid.UUID, type_label_id: uuid.UUID
+) -> tuple[TypeLabelFile, bool]:
+    """Idempotent manual add (#50): INSERT ... ON CONFLICT (file_id, type_label_id)
+    DO UPDATE SET status='confirmed'. Structurally removes the old check-then-
+    insert race (two concurrent identical adds both land here safely: one
+    insert, one no-op-ish update) and the dead end where a REJECTED row blocked
+    re-adding via 409 -- a conflict now just flips it to confirmed.
+
+    DO UPDATE touches status (and updated_at) only, never source: source is
+    provenance (who originally suggested this), status is the user's verdict
+    -- mirrors the existing PATCH confirm path, which also never rewrites
+    source. updated_at is set explicitly here because this bypasses the ORM's
+    onupdate=func.now() (that only fires for ORM-tracked attribute writes,
+    not a Core on_conflict_do_update's SET clause).
+
+    Returns (row, inserted) so the route can pick 201 (fresh insert) vs
+    200 (existing row, now confirmed). inserted comes from the classic
+    Postgres `xmax = 0` trick: a freshly inserted row's xmax is 0, while a
+    row touched by the DO UPDATE branch has it set to the current transaction.
+    """
+    stmt = (
+        pg_insert(TypeLabelFile)
+        .values(file_id=file_id, type_label_id=type_label_id, source="user", status="confirmed")
+        .on_conflict_do_update(
+            index_elements=[TypeLabelFile.file_id, TypeLabelFile.type_label_id],
+            set_={"status": "confirmed", "updated_at": func.now()},
+        )
+        .returning(TypeLabelFile, literal_column("(xmax = 0)").label("inserted"))
+        .execution_options(populate_existing=True)
     )
-    db.add(row)
+    result = db.execute(stmt).one()
+    row, inserted = result[0], result.inserted
     db.commit()
     db.refresh(row)
-    return row
+    return row, inserted
 
 
 def remove_type_labels_file(db: Session, row: TypeLabelFile) -> None:
@@ -205,20 +219,6 @@ def list_tag_labels(db: Session, file_id: uuid.UUID) -> list[TagLabel]:
 
 def get_tag_label_by_id(db: Session, tag_label_id: uuid.UUID) -> TagLabel | None:
     return db.get(TagLabel, tag_label_id)
-
-
-def get_tag_label_by_kind_and_value(
-    db: Session, file_id: uuid.UUID, kind_id: uuid.UUID, value: str
-) -> TagLabel | None:
-    """Fetch a (file_id, kind_id, value) row, case-insensitively (#49: "Berlin"
-    and "berlin" are the same tag). Used for duplicate checks on manual add."""
-    return db.scalar(
-        select(TagLabel).where(
-            TagLabel.file_id == file_id,
-            TagLabel.kind_id == kind_id,
-            func.lower(TagLabel.value) == value.lower(),
-        )
-    )
 
 
 def batch_patch_tag_labels(
@@ -254,18 +254,31 @@ def batch_patch_tag_labels(
     return [row for row, _ in to_update]
 
 
-def add_user_tag_label(db: Session, file_id: uuid.UUID, kind: TagKind, value: str) -> TagLabel:
-    row = TagLabel(
-        file_id=file_id,
-        kind_id=kind.id,
-        value=value,
-        source="user",
-        status="confirmed",
+def upsert_user_tag_label(
+    db: Session, file_id: uuid.UUID, kind_id: uuid.UUID, value: str
+) -> tuple[TagLabel, bool]:
+    """Idempotent manual add (#50), tag facet -- see upsert_user_type_label for
+    the source/status split and race-elimination rationale.
+
+    Conflict target is the case-insensitive expression index from #49
+    (ix_tag_labels_file_kind_value_lower): "Berlin" and "berlin" collide here
+    even though value itself is stored as-is, un-normalized.
+    """
+    stmt = (
+        pg_insert(TagLabel)
+        .values(file_id=file_id, kind_id=kind_id, value=value, source="user", status="confirmed")
+        .on_conflict_do_update(
+            index_elements=[TagLabel.file_id, TagLabel.kind_id, func.lower(TagLabel.value)],
+            set_={"status": "confirmed", "updated_at": func.now()},
+        )
+        .returning(TagLabel, literal_column("(xmax = 0)").label("inserted"))
+        .execution_options(populate_existing=True)
     )
-    db.add(row)
+    result = db.execute(stmt).one()
+    row, inserted = result[0], result.inserted
     db.commit()
     db.refresh(row)
-    return row
+    return row, inserted
 
 
 def remove_tag_label(db: Session, row: TagLabel) -> None:

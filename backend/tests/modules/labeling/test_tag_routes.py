@@ -129,17 +129,47 @@ def test_add_user_tag_unknown_kind_404(client, file_id):
     assert resp.status_code == 404
 
 
-def test_add_user_tag_duplicate_409(client, file_id, tag_kind):
-    client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
+def test_add_user_tag_duplicate_is_idempotent_200(client, db, file_id, tag_kind):
+    """#50: a repeat manual add is not an error -- it's a no-op confirm."""
+    first = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
+    assert first.status_code == 201
+
     resp = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
-    assert resp.status_code == 409
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == first.json()["id"]  # same row, not a new one
+    assert len(list(db.scalars(select(TagLabel).where(TagLabel.file_id == file_id)))) == 1
 
 
-def test_add_user_tag_case_variant_duplicate_409(client, file_id, tag_kind):
-    """#49: "Berlin" and "berlin" are the same tag under a kind."""
-    client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
+def test_add_user_tag_case_variant_duplicate_is_idempotent_200(client, db, file_id, tag_kind):
+    """#49+#50: "Berlin" and "berlin" are the same tag under a kind -- the
+    case-variant repeat is idempotent, not an error."""
+    first = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
+    assert first.status_code == 201
+
     resp = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "berlin"})
-    assert resp.status_code == 409
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == first.json()["id"]
+    assert resp.json()["value"] == "Berlin"  # stored value untouched by the conflicting "berlin"
+    assert len(list(db.scalars(select(TagLabel).where(TagLabel.file_id == file_id)))) == 1
+
+
+def test_add_user_tag_flips_rejected_to_confirmed_200(client, db, file_id, tag_kind):
+    """#50: the dead end -- LLM suggested, user rejected, user manually re-adds
+    -- must now succeed (200), not 409 with no way forward."""
+    rejected = TagLabel(file_id=file_id, kind_id=tag_kind.id, value="Berlin", source="llm", status="rejected")
+    db.add(rejected)
+    db.commit()
+    db.refresh(rejected)
+
+    resp = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["id"] == str(rejected.id)
+    assert data["status"] == "confirmed"
+    assert data["source"] == "llm"  # provenance untouched -- only status flips
 
 
 def test_add_user_tag_rejects_blank_value(client, file_id, tag_kind):
