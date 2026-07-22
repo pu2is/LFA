@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
@@ -210,12 +210,13 @@ def get_tag_label_by_id(db: Session, tag_label_id: uuid.UUID) -> TagLabel | None
 def get_tag_label_by_kind_and_value(
     db: Session, file_id: uuid.UUID, kind_id: uuid.UUID, value: str
 ) -> TagLabel | None:
-    """Fetch a (file_id, kind_id, value) row. Used for duplicate checks on manual add."""
+    """Fetch a (file_id, kind_id, value) row, case-insensitively (#49: "Berlin"
+    and "berlin" are the same tag). Used for duplicate checks on manual add."""
     return db.scalar(
         select(TagLabel).where(
             TagLabel.file_id == file_id,
             TagLabel.kind_id == kind_id,
-            TagLabel.value == value,
+            func.lower(TagLabel.value) == value.lower(),
         )
     )
 

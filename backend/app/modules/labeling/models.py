@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func, text
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -19,9 +19,15 @@ class TypeLabel(Base):
     """Catalog table: type values are shared across files (true M:N)."""
 
     __tablename__ = "type_labels"
+    __table_args__ = (
+        # #49: case-insensitive uniqueness -- "Berlin" and "berlin" are the same
+        # catalog entry. name is already lowercased app-side (normalize_label_name),
+        # but the DB constraint enforces it independent of that.
+        Index("ix_type_labels_name_lower", text("lower(name)"), unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name: Mapped[str] = mapped_column(String, unique=True)
+    name: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -61,9 +67,13 @@ class TagKind(Base):
     """Controlled vocabulary for tag *kinds* only -- tag values are not cataloged."""
 
     __tablename__ = "tag_kinds"
+    __table_args__ = (
+        # #49: case-insensitive uniqueness, same reasoning as TypeLabel above.
+        Index("ix_tag_kinds_name_lower", text("lower(name)"), unique=True),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name: Mapped[str] = mapped_column(String, unique=True)
+    name: Mapped[str] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -72,8 +82,11 @@ class TagLabel(Base):
 
     __tablename__ = "tag_labels"
     __table_args__ = (
-        # Augment (append-only) dedupes new suggestions against this.
-        UniqueConstraint("file_id", "kind_id", "value"),
+        # Augment (append-only) dedupes new suggestions against this. #49:
+        # case-insensitive -- "Berlin" and "berlin" under the same kind are
+        # the same tag; value is free text so, unlike TypeLabel/TagKind.name,
+        # nothing normalizes it app-side before it reaches this constraint.
+        Index("ix_tag_labels_file_kind_value_lower", "file_id", "kind_id", text("lower(value)"), unique=True),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

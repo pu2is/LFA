@@ -178,6 +178,33 @@ def test_suggest_labels_deduplicates_repeated_tag_value(db, file_and_job, seeded
     assert len(tag_rows) == 1
 
 
+def test_suggest_labels_deduplicates_case_variant_of_existing_tag_value(db, file_and_job, seeded_catalogs):
+    """#49: a confirmed "Berlin" already on file must block a re-suggested "berlin"."""
+    file, job = file_and_job
+    _, kinds = seeded_catalogs
+    place_kind = next(k for k in kinds if k.name == "place")
+    db.add(TagLabel(file_id=file.id, kind_id=place_kind.id, value="Berlin", source="user", status="confirmed"))
+    db.commit()
+
+    llm, *_ = _mock_llm(type_names=[], kind_names=["place"], tag_values_per_kind=[["berlin"]])
+
+    _, tag_rows = suggest_labels(db, file.id, job, llm=llm)
+
+    assert tag_rows == []
+
+
+def test_suggest_labels_deduplicates_case_variant_within_same_batch(db, file_and_job, seeded_catalogs):
+    """#49: "Berlin" and "berlin" in the SAME LLM output count as one candidate."""
+    file, job = file_and_job
+    llm, *_ = _mock_llm(
+        type_names=[], kind_names=["place"], tag_values_per_kind=[["Berlin", "berlin"]]
+    )
+
+    _, tag_rows = suggest_labels(db, file.id, job, llm=llm)
+
+    assert len(tag_rows) == 1
+
+
 def test_suggest_labels_handles_multiple_chosen_kinds_in_order(db, file_and_job, seeded_catalogs):
     file, job = file_and_job
     llm, *_ = _mock_llm(

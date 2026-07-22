@@ -157,9 +157,11 @@ def suggest_labels(
     # One upfront query for the whole file instead of one per kind inside
     # the loop -- see #47 code review. Mirrors suggest_labels_augment, which
     # already loads existing tags once and slices by kind_id.
+    # Lowercased (#49): write_tag_candidates's existing_values contract is
+    # case-insensitive, matching ix_tag_labels_file_kind_value_lower.
     existing_by_kind: dict[uuid.UUID, set[str]] = {}
     for value, kind_id in db.execute(select(TagLabel.value, TagLabel.kind_id).where(TagLabel.file_id == file_id)):
-        existing_by_kind.setdefault(kind_id, set()).add(value)
+        existing_by_kind.setdefault(kind_id, set()).add(value.lower())
 
     tag_labels: list[TagLabel] = []
     tag_llm = llm.with_structured_output(TagValuesOutput)
@@ -252,8 +254,12 @@ def suggest_labels_augment(
         )
         output: TagValuesOutput = _invoke_or_raise(structured_llm, messages, file_id=file_id)
 
+        # Lowercased for the dedup check (#49); all_existing above stays
+        # original-case since it also feeds the prompt text.
         tag_labels.extend(
-            write_tag_candidates(db, file_id, kind, output, existing_values=set(all_existing))
+            write_tag_candidates(
+                db, file_id, kind, output, existing_values={v.lower() for v in all_existing}
+            )
         )
 
     logger.info(

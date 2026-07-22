@@ -135,6 +135,13 @@ def test_add_user_tag_duplicate_409(client, file_id, tag_kind):
     assert resp.status_code == 409
 
 
+def test_add_user_tag_case_variant_duplicate_409(client, file_id, tag_kind):
+    """#49: "Berlin" and "berlin" are the same tag under a kind."""
+    client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "Berlin"})
+    resp = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "berlin"})
+    assert resp.status_code == 409
+
+
 def test_add_user_tag_rejects_blank_value(client, file_id, tag_kind):
     resp = client.post(f"/files/{file_id}/tags", json={"kind_id": str(tag_kind.id), "value": "   "})
     assert resp.status_code == 422
