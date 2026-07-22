@@ -17,31 +17,46 @@ def normalize_label_name(raw: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def ensure_type_catalog(db: Session) -> list[TypeLabel]:
-    """Return all type_labels; auto-populate from presets if empty."""
+    """Return all type_labels; auto-populate from presets if empty.
+
+    #51: two RQ workers can both see an empty catalog on the first-ever label
+    job and both try to seed it. Seeding is INSERT ... ON CONFLICT (lower(name))
+    DO NOTHING (conflict target matches #49's case-insensitive expression
+    index) instead of add_all + commit, so the loser's redundant inserts are
+    silently skipped instead of raising IntegrityError and failing the job.
+    Re-reads afterward -- the concurrent seeder may have inserted rows this
+    call didn't.
+    """
     types = list(db.scalars(select(TypeLabel)))
     if types:
         return types
 
-    new_types = [TypeLabel(name=name) for name in TYPE_LABEL_PRESETS]
-    db.add_all(new_types)
+    stmt = (
+        pg_insert(TypeLabel)
+        .values([{"name": name} for name in TYPE_LABEL_PRESETS])
+        .on_conflict_do_nothing(index_elements=[func.lower(TypeLabel.name)])
+    )
+    db.execute(stmt)
     db.commit()
-    for t in new_types:
-        db.refresh(t)
-    return new_types
+    return list(db.scalars(select(TypeLabel)))
 
 
 def ensure_tag_kind_catalog(db: Session) -> list[TagKind]:
-    """Return all tag_kinds; auto-populate from TAG_KIND_PRESETS if empty."""
+    """Return all tag_kinds; auto-populate from TAG_KIND_PRESETS if empty.
+    See ensure_type_catalog for the #51 concurrency-safe seeding rationale.
+    """
     kinds = list(db.scalars(select(TagKind)))
     if kinds:
         return kinds
 
-    new_kinds = [TagKind(name=name) for name in TAG_KIND_PRESETS]
-    db.add_all(new_kinds)
+    stmt = (
+        pg_insert(TagKind)
+        .values([{"name": name} for name in TAG_KIND_PRESETS])
+        .on_conflict_do_nothing(index_elements=[func.lower(TagKind.name)])
+    )
+    db.execute(stmt)
     db.commit()
-    for k in new_kinds:
-        db.refresh(k)
-    return new_kinds
+    return list(db.scalars(select(TagKind)))
 
 
 def get_files_with_type_or_tag_labels(db: Session, file_ids: list[uuid.UUID]) -> set[uuid.UUID]:
@@ -72,16 +87,31 @@ def get_type_label(db: Session, type_label_id: uuid.UUID) -> TypeLabel | None:
 
 
 def bulk_create_type_labels(db: Session, names: list[str]) -> tuple[list[TypeLabel], list[str]]:
+    """#51: same check-then-insert race as ensure_type_catalog, user-triggered
+    instead of first-job-triggered -- two concurrent bulk-creates for an
+    overlapping name used to be able to crash one of them on the UNIQUE
+    index. INSERT ... ON CONFLICT (lower(name)) DO NOTHING + RETURNING makes
+    it race-safe: only actually-inserted rows come back, so `skipped` (names
+    that already existed, whether before this call or via a losing race
+    against a concurrent caller) falls out the same way either way.
+    """
     unique_names = list(dict.fromkeys(names))
+    if not unique_names:
+        return [], []
 
-    existing_names = set(db.scalars(select(TypeLabel.name).where(TypeLabel.name.in_(unique_names))))
-    skipped = [name for name in unique_names if name in existing_names]
-    types = [TypeLabel(name=name) for name in unique_names if name not in existing_names]
-
-    db.add_all(types)
+    stmt = (
+        pg_insert(TypeLabel)
+        .values([{"name": name} for name in unique_names])
+        .on_conflict_do_nothing(index_elements=[func.lower(TypeLabel.name)])
+        .returning(TypeLabel)
+    )
+    types = list(db.scalars(stmt))
     db.commit()
     for t in types:
         db.refresh(t)
+
+    inserted_names = {t.name for t in types}
+    skipped = [name for name in unique_names if name not in inserted_names]
     return types, skipped
 
 
@@ -103,16 +133,24 @@ def get_tag_kind(db: Session, tag_kind_id: uuid.UUID) -> TagKind | None:
 
 
 def bulk_create_tag_kinds(db: Session, names: list[str]) -> tuple[list[TagKind], list[str]]:
+    """#51: see bulk_create_type_labels for the concurrency-safe seeding rationale."""
     unique_names = list(dict.fromkeys(names))
+    if not unique_names:
+        return [], []
 
-    existing_names = set(db.scalars(select(TagKind.name).where(TagKind.name.in_(unique_names))))
-    skipped = [name for name in unique_names if name in existing_names]
-    kinds = [TagKind(name=name) for name in unique_names if name not in existing_names]
-
-    db.add_all(kinds)
+    stmt = (
+        pg_insert(TagKind)
+        .values([{"name": name} for name in unique_names])
+        .on_conflict_do_nothing(index_elements=[func.lower(TagKind.name)])
+        .returning(TagKind)
+    )
+    kinds = list(db.scalars(stmt))
     db.commit()
     for k in kinds:
         db.refresh(k)
+
+    inserted_names = {k.name for k in kinds}
+    skipped = [name for name in unique_names if name not in inserted_names]
     return kinds, skipped
 
 

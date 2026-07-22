@@ -8,7 +8,12 @@ from sqlalchemy import select
 
 from app.modules.labeling.models import TagKind, TypeLabel
 from app.modules.labeling.presets import TAG_KIND_PRESETS, TYPE_LABEL_PRESETS
-from app.modules.labeling.service import ensure_tag_kind_catalog, ensure_type_catalog
+from app.modules.labeling.service import (
+    bulk_create_tag_kinds,
+    bulk_create_type_labels,
+    ensure_tag_kind_catalog,
+    ensure_type_catalog,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -42,6 +47,23 @@ def test_ensure_type_catalog_leaves_existing_catalog_untouched(db):
     assert [t.name for t in types] == ["custom_type"]
 
 
+def test_ensure_type_catalog_survives_a_racing_duplicate_seed(db):
+    """#51: two RQ workers can both see an empty catalog and both attempt to
+    seed all presets. Simulated here via bulk_create_type_labels (same ON
+    CONFLICT DO NOTHING mechanism, no empty-table gate) re-inserting the
+    exact same preset names after ensure_type_catalog already seeded them --
+    must not raise IntegrityError, and the catalog must stay complete, not
+    doubled."""
+    first = ensure_type_catalog(db)
+    assert len(first) == len(TYPE_LABEL_PRESETS)
+
+    created, skipped = bulk_create_type_labels(db, list(TYPE_LABEL_PRESETS))
+
+    assert created == []  # every name already existed -- nothing new to insert
+    assert set(skipped) == set(TYPE_LABEL_PRESETS)
+    assert len(list(db.scalars(select(TypeLabel)))) == len(TYPE_LABEL_PRESETS)
+
+
 # --------------------------------------------------------------------------- #
 # ensure_tag_kind_catalog
 # --------------------------------------------------------------------------- #
@@ -70,3 +92,15 @@ def test_ensure_tag_kind_catalog_leaves_existing_catalog_untouched(db):
     kinds = ensure_tag_kind_catalog(db)
 
     assert [k.name for k in kinds] == ["custom_kind"]
+
+
+def test_ensure_tag_kind_catalog_survives_a_racing_duplicate_seed(db):
+    """#51: see test_ensure_type_catalog_survives_a_racing_duplicate_seed."""
+    first = ensure_tag_kind_catalog(db)
+    assert len(first) == len(TAG_KIND_PRESETS)
+
+    created, skipped = bulk_create_tag_kinds(db, list(TAG_KIND_PRESETS))
+
+    assert created == []
+    assert set(skipped) == set(TAG_KIND_PRESETS)
+    assert len(list(db.scalars(select(TagKind)))) == len(TAG_KIND_PRESETS)
