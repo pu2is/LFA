@@ -38,23 +38,33 @@ def _require_file(db: Session, file_id: uuid.UUID) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
 
-def _delete_catalog_entry_or_409(db: Session, delete_fn, entry, label: str) -> None:
-    """Shared body for the type-labels/tag-kinds catalog DELETE routes:
-    run delete_fn, translating the FK-violation IntegrityError (entry still
-    attached to files) into a 409 instead of an unhandled 500. Only safe
-    because each catalog table has exactly one inbound FK today (models.py);
-    revisit if either table ever gains a second one, since this would then
-    also catch -- and misreport as "still referenced" -- an unrelated
-    constraint violation on the same delete.
+# #55: constraint names for the one known inbound FK per catalog table
+# (models.py); confirmed against the DB, not just the migration, since
+# neither the ForeignKey() column defs nor the migration's
+# ForeignKeyConstraint() calls pass an explicit name -- Postgres assigns the
+# default "<table>_<column>_fkey" itself.
+TYPE_LABEL_IN_USE_FK = "type_labels_files_type_label_id_fkey"
+TAG_KIND_IN_USE_FK = "tag_labels_kind_id_fkey"
+
+
+def _delete_catalog_entry_or_409(db: Session, delete_fn, entry, label: str, fk_constraint: str) -> None:
+    """Shared body for the type-labels/tag-kinds catalog DELETE routes: run
+    delete_fn, translating the FK-violation IntegrityError (entry still
+    attached to files) into a 409 instead of an unhandled 500. Checks the
+    violated constraint's name so an unrelated IntegrityError on the same
+    delete (e.g. a second inbound FK added later) surfaces as-is instead of
+    being misreported as "still referenced".
     """
     try:
         delete_fn(db, entry)
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
+        if exc.orig.diag.constraint_name != fk_constraint:
+            raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"{label} is still referenced by one or more files",
-        )
+        ) from None
 
 
 router = APIRouter(tags=["labels"])
@@ -166,7 +176,7 @@ def remove_type_label(type_label_id: uuid.UUID, db: Session = Depends(get_db)) -
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Type label not found")
 
     deleted = TypeLabelRead.model_validate(type_label)
-    _delete_catalog_entry_or_409(db, service.delete_type_label, type_label, "Type label")
+    _delete_catalog_entry_or_409(db, service.delete_type_label, type_label, "Type label", TYPE_LABEL_IN_USE_FK)
     return deleted
 
 
@@ -190,7 +200,7 @@ def remove_tag_kind(tag_kind_id: uuid.UUID, db: Session = Depends(get_db)) -> Ta
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag kind not found")
 
     deleted = TagKindRead.model_validate(tag_kind)
-    _delete_catalog_entry_or_409(db, service.delete_tag_kind, tag_kind, "Tag kind")
+    _delete_catalog_entry_or_409(db, service.delete_tag_kind, tag_kind, "Tag kind", TAG_KIND_IN_USE_FK)
     return deleted
 
 
