@@ -205,6 +205,18 @@ def test_augment_deduplicates_against_all_existing_values_regardless_of_status(d
     assert [row.value for row in result] == ["Genuinely New Person"]
 
 
+def test_augment_deduplicates_case_variant_of_existing_value(db, file_id, person_kind):
+    """#49: augment's temperature=0.7 tends to re-suggest case variants of a
+    value already there -- "angela merkel" must not duplicate "Angela Merkel"."""
+    db.add(TagLabel(file_id=file_id, kind_id=person_kind.id, value="Angela Merkel", source="llm", status="confirmed"))
+    db.commit()
+
+    llm, _ = _mock_llm([["angela merkel"]])
+    result = suggest_labels_augment(db, file_id, llm=llm)
+
+    assert result == []
+
+
 def test_augment_skips_empty_output_for_a_kind(db, file_id, person_kind):
     db.add(TagLabel(file_id=file_id, kind_id=person_kind.id, value="Angela Merkel", source="llm", status="confirmed"))
     db.commit()

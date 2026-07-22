@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -221,15 +221,19 @@ def batch_patch_file_type_labels(
 def add_user_type_label(
     file_id: uuid.UUID,
     payload: TypeLabelFileAdd,
+    response: Response,
     db: Session = Depends(get_db),
 ):
+    """Idempotent upsert (#50): a type_label_id already on this file (any
+    status, including rejected) is confirmed in place -- 200, not 409/404."""
     _require_file(db, file_id)
     type_label = service.get_type_label(db, payload.type_label_id)
     if type_label is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Type label not found")
-    if service.get_type_labels_file_by_catalog(db, file_id, payload.type_label_id) is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Type label already attached to this file")
-    return service.add_user_type_label(db, file_id, type_label)
+    row, inserted = service.upsert_user_type_label(db, file_id, payload.type_label_id)
+    if not inserted:
+        response.status_code = status.HTTP_200_OK
+    return row
 
 
 @router.delete("/files/{file_id}/type-labels/{type_label_file_id}", response_model=TypeLabelFileRead)
@@ -273,15 +277,20 @@ def batch_patch_file_tags(
 def add_user_tag(
     file_id: uuid.UUID,
     payload: TagLabelAdd,
+    response: Response,
     db: Session = Depends(get_db),
 ):
+    """Idempotent upsert (#50): a (kind_id, value) already on this file (any
+    status, including rejected, matched case-insensitively per #49) is
+    confirmed in place -- 200, not 409/404."""
     _require_file(db, file_id)
     kind = service.get_tag_kind(db, payload.kind_id)
     if kind is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag kind not found")
-    if service.get_tag_label_by_kind_and_value(db, file_id, payload.kind_id, payload.value) is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tag already attached to this file")
-    return service.add_user_tag_label(db, file_id, kind, payload.value)
+    row, inserted = service.upsert_user_tag_label(db, file_id, payload.kind_id, payload.value)
+    if not inserted:
+        response.status_code = status.HTTP_200_OK
+    return row
 
 
 @router.delete("/files/{file_id}/tags/{tag_label_id}", response_model=TagLabelRead)

@@ -91,35 +91,39 @@ def write_tag_candidates(
     under this (file, kind), dedup against what's already there."
 
     Unlike type names, tag values are free text and are NOT case-normalized
-    (e.g. a person's name) -- only exact-duplicate/blank values are dropped.
-    An empty output simply writes nothing; no special-casing needed.
+    on write (e.g. a person's name) -- but duplicates are now judged case-
+    insensitively (#49: "Berlin" vs "berlin"), matching the DB's
+    ix_tag_labels_file_kind_value_lower index. Only blank values are dropped
+    outright. An empty output simply writes nothing; no special-casing needed.
 
-    Idempotent against (file_id, kind_id, value): a retried/re-triggered run
-    (or augment re-suggesting a value already there) is a no-op, never a
-    UNIQUE-constraint crash. This is also exactly augment's own append-only
-    requirement (docs/workflow/01c-file-label-augment.md) -- confirmed/
-    rejected/suggested rows already in the DB are never touched, since only
-    genuinely-new values reach the INSERT below.
+    Idempotent against (file_id, kind_id, lower(value)): a retried/re-
+    triggered run (or augment re-suggesting a value already there, including
+    a case variant) is a no-op, never a UNIQUE-constraint crash. This is also
+    exactly augment's own append-only requirement (docs/workflow/01c-file-
+    label-augment.md) -- confirmed/rejected/suggested rows already in the DB
+    are never touched, since only genuinely-new values reach the INSERT below.
 
-    existing_values: pass this (file, kind)'s current values if the caller
-    already has them loaded (augment does, from its own upfront query) to
-    skip the redundant re-query; omitted (initial's Call 3, which has no
-    prior read of tag_labels) queries them here.
+    existing_values: pass this (file, kind)'s current values, lowercased, if
+    the caller already has them loaded (augment does, from its own upfront
+    query) to skip the redundant re-query; omitted (initial's Call 3, which
+    has no prior read of tag_labels) queries and lowercases them here.
     """
     if existing_values is None:
-        existing_values = set(
-            db.scalars(
+        existing_values = {
+            v.lower()
+            for v in db.scalars(
                 select(TagLabel.value).where(TagLabel.file_id == file_id, TagLabel.kind_id == kind.id)
             )
-        )
+        }
     rows: list[TagLabel] = []
     seen: set[str] = set()
 
     for raw_value in output.values:
         value = raw_value.strip()
-        if not value or value in seen or value in existing_values:
+        value_lower = value.lower()
+        if not value or value_lower in seen or value_lower in existing_values:
             continue
-        seen.add(value)
+        seen.add(value_lower)
 
         row = TagLabel(file_id=file_id, kind_id=kind.id, value=value, source="llm", status="suggested")
         db.add(row)

@@ -1,10 +1,11 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, literal_column, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
-from app.modules.labeling.presets import OPTIONAL_LABELS, RECOMMENDED_LABELS, TAG_KIND_PRESETS
+from app.modules.labeling.presets import TAG_KIND_PRESETS, TYPE_LABEL_PRESETS
 
 
 def normalize_label_name(raw: str) -> str:
@@ -16,32 +17,46 @@ def normalize_label_name(raw: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def ensure_type_catalog(db: Session) -> list[TypeLabel]:
-    """Return all type_labels; auto-populate from presets if empty."""
+    """Return all type_labels; auto-populate from presets if empty.
+
+    #51: two RQ workers can both see an empty catalog on the first-ever label
+    job and both try to seed it. Seeding is INSERT ... ON CONFLICT (lower(name))
+    DO NOTHING (conflict target matches #49's case-insensitive expression
+    index) instead of add_all + commit, so the loser's redundant inserts are
+    silently skipped instead of raising IntegrityError and failing the job.
+    Re-reads afterward -- the concurrent seeder may have inserted rows this
+    call didn't.
+    """
     types = list(db.scalars(select(TypeLabel)))
     if types:
         return types
 
-    all_preset_names = list(RECOMMENDED_LABELS) + list(OPTIONAL_LABELS)
-    new_types = [TypeLabel(name=name) for name in all_preset_names]
-    db.add_all(new_types)
+    stmt = (
+        pg_insert(TypeLabel)
+        .values([{"name": name} for name in TYPE_LABEL_PRESETS])
+        .on_conflict_do_nothing(index_elements=[func.lower(TypeLabel.name)])
+    )
+    db.execute(stmt)
     db.commit()
-    for t in new_types:
-        db.refresh(t)
-    return new_types
+    return list(db.scalars(select(TypeLabel)))
 
 
 def ensure_tag_kind_catalog(db: Session) -> list[TagKind]:
-    """Return all tag_kinds; auto-populate from TAG_KIND_PRESETS if empty."""
+    """Return all tag_kinds; auto-populate from TAG_KIND_PRESETS if empty.
+    See ensure_type_catalog for the #51 concurrency-safe seeding rationale.
+    """
     kinds = list(db.scalars(select(TagKind)))
     if kinds:
         return kinds
 
-    new_kinds = [TagKind(name=name) for name in TAG_KIND_PRESETS]
-    db.add_all(new_kinds)
+    stmt = (
+        pg_insert(TagKind)
+        .values([{"name": name} for name in TAG_KIND_PRESETS])
+        .on_conflict_do_nothing(index_elements=[func.lower(TagKind.name)])
+    )
+    db.execute(stmt)
     db.commit()
-    for k in new_kinds:
-        db.refresh(k)
-    return new_kinds
+    return list(db.scalars(select(TagKind)))
 
 
 def get_files_with_type_or_tag_labels(db: Session, file_ids: list[uuid.UUID]) -> set[uuid.UUID]:
@@ -72,16 +87,31 @@ def get_type_label(db: Session, type_label_id: uuid.UUID) -> TypeLabel | None:
 
 
 def bulk_create_type_labels(db: Session, names: list[str]) -> tuple[list[TypeLabel], list[str]]:
+    """#51: same check-then-insert race as ensure_type_catalog, user-triggered
+    instead of first-job-triggered -- two concurrent bulk-creates for an
+    overlapping name used to be able to crash one of them on the UNIQUE
+    index. INSERT ... ON CONFLICT (lower(name)) DO NOTHING + RETURNING makes
+    it race-safe: only actually-inserted rows come back, so `skipped` (names
+    that already existed, whether before this call or via a losing race
+    against a concurrent caller) falls out the same way either way.
+    """
     unique_names = list(dict.fromkeys(names))
+    if not unique_names:
+        return [], []
 
-    existing_names = set(db.scalars(select(TypeLabel.name).where(TypeLabel.name.in_(unique_names))))
-    skipped = [name for name in unique_names if name in existing_names]
-    types = [TypeLabel(name=name) for name in unique_names if name not in existing_names]
-
-    db.add_all(types)
+    stmt = (
+        pg_insert(TypeLabel)
+        .values([{"name": name} for name in unique_names])
+        .on_conflict_do_nothing(index_elements=[func.lower(TypeLabel.name)])
+        .returning(TypeLabel)
+    )
+    types = list(db.scalars(stmt))
     db.commit()
     for t in types:
         db.refresh(t)
+
+    inserted_names = {t.name for t in types}
+    skipped = [name for name in unique_names if name not in inserted_names]
     return types, skipped
 
 
@@ -103,16 +133,24 @@ def get_tag_kind(db: Session, tag_kind_id: uuid.UUID) -> TagKind | None:
 
 
 def bulk_create_tag_kinds(db: Session, names: list[str]) -> tuple[list[TagKind], list[str]]:
+    """#51: see bulk_create_type_labels for the concurrency-safe seeding rationale."""
     unique_names = list(dict.fromkeys(names))
+    if not unique_names:
+        return [], []
 
-    existing_names = set(db.scalars(select(TagKind.name).where(TagKind.name.in_(unique_names))))
-    skipped = [name for name in unique_names if name in existing_names]
-    kinds = [TagKind(name=name) for name in unique_names if name not in existing_names]
-
-    db.add_all(kinds)
+    stmt = (
+        pg_insert(TagKind)
+        .values([{"name": name} for name in unique_names])
+        .on_conflict_do_nothing(index_elements=[func.lower(TagKind.name)])
+        .returning(TagKind)
+    )
+    kinds = list(db.scalars(stmt))
     db.commit()
     for k in kinds:
         db.refresh(k)
+
+    inserted_names = {k.name for k in kinds}
+    skipped = [name for name in unique_names if name not in inserted_names]
     return kinds, skipped
 
 
@@ -133,18 +171,6 @@ def get_type_labels_file_by_id(db: Session, type_label_file_id: uuid.UUID) -> Ty
     return db.get(TypeLabelFile, type_label_file_id)
 
 
-def get_type_labels_file_by_catalog(
-    db: Session, file_id: uuid.UUID, type_label_id: uuid.UUID
-) -> TypeLabelFile | None:
-    """Fetch a (file_id, type_label_id) row. Used for duplicate checks on manual add."""
-    return db.scalar(
-        select(TypeLabelFile).where(
-            TypeLabelFile.file_id == file_id,
-            TypeLabelFile.type_label_id == type_label_id,
-        )
-    )
-
-
 def batch_patch_type_labels_files(
     db: Session,
     file_id: uuid.UUID,
@@ -155,10 +181,13 @@ def batch_patch_type_labels_files(
     All-or-nothing: raises ValueError listing any IDs not found or not belonging
     to this file so the caller can return a 404 before touching the DB.
     """
+    ids = [row_id for row_id, _ in operations]
+    rows_by_id = {row.id: row for row in db.scalars(select(TypeLabelFile).where(TypeLabelFile.id.in_(ids)))}
+
     to_update: list[tuple[TypeLabelFile, str]] = []
     missing: list[str] = []
     for row_id, action in operations:
-        row = get_type_labels_file_by_id(db, row_id)
+        row = rows_by_id.get(row_id)
         if row is None or row.file_id != file_id:
             missing.append(str(row_id))
         else:
@@ -175,17 +204,42 @@ def batch_patch_type_labels_files(
     return [row for row, _ in to_update]
 
 
-def add_user_type_label(db: Session, file_id: uuid.UUID, type_label: TypeLabel) -> TypeLabelFile:
-    row = TypeLabelFile(
-        file_id=file_id,
-        type_label_id=type_label.id,
-        source="user",
-        status="confirmed",
+def upsert_user_type_label(
+    db: Session, file_id: uuid.UUID, type_label_id: uuid.UUID
+) -> tuple[TypeLabelFile, bool]:
+    """Idempotent manual add (#50): INSERT ... ON CONFLICT (file_id, type_label_id)
+    DO UPDATE SET status='confirmed'. Structurally removes the old check-then-
+    insert race (two concurrent identical adds both land here safely: one
+    insert, one no-op-ish update) and the dead end where a REJECTED row blocked
+    re-adding via 409 -- a conflict now just flips it to confirmed.
+
+    DO UPDATE touches status (and updated_at) only, never source: source is
+    provenance (who originally suggested this), status is the user's verdict
+    -- mirrors the existing PATCH confirm path, which also never rewrites
+    source. updated_at is set explicitly here because this bypasses the ORM's
+    onupdate=func.now() (that only fires for ORM-tracked attribute writes,
+    not a Core on_conflict_do_update's SET clause).
+
+    Returns (row, inserted) so the route can pick 201 (fresh insert) vs
+    200 (existing row, now confirmed). inserted comes from the classic
+    Postgres `xmax = 0` trick: a freshly inserted row's xmax is 0, while a
+    row touched by the DO UPDATE branch has it set to the current transaction.
+    """
+    stmt = (
+        pg_insert(TypeLabelFile)
+        .values(file_id=file_id, type_label_id=type_label_id, source="user", status="confirmed")
+        .on_conflict_do_update(
+            index_elements=[TypeLabelFile.file_id, TypeLabelFile.type_label_id],
+            set_={"status": "confirmed", "updated_at": func.now()},
+        )
+        .returning(TypeLabelFile, literal_column("(xmax = 0)").label("inserted"))
+        .execution_options(populate_existing=True)
     )
-    db.add(row)
+    result = db.execute(stmt).one()
+    row, inserted = result[0], result.inserted
     db.commit()
     db.refresh(row)
-    return row
+    return row, inserted
 
 
 def remove_type_labels_file(db: Session, row: TypeLabelFile) -> None:
@@ -205,19 +259,6 @@ def get_tag_label_by_id(db: Session, tag_label_id: uuid.UUID) -> TagLabel | None
     return db.get(TagLabel, tag_label_id)
 
 
-def get_tag_label_by_kind_and_value(
-    db: Session, file_id: uuid.UUID, kind_id: uuid.UUID, value: str
-) -> TagLabel | None:
-    """Fetch a (file_id, kind_id, value) row. Used for duplicate checks on manual add."""
-    return db.scalar(
-        select(TagLabel).where(
-            TagLabel.file_id == file_id,
-            TagLabel.kind_id == kind_id,
-            TagLabel.value == value,
-        )
-    )
-
-
 def batch_patch_tag_labels(
     db: Session,
     file_id: uuid.UUID,
@@ -228,10 +269,13 @@ def batch_patch_tag_labels(
     All-or-nothing: raises ValueError listing any IDs not found or not belonging
     to this file so the caller can return a 404 before touching the DB.
     """
+    ids = [row_id for row_id, _ in operations]
+    rows_by_id = {row.id: row for row in db.scalars(select(TagLabel).where(TagLabel.id.in_(ids)))}
+
     to_update: list[tuple[TagLabel, str]] = []
     missing: list[str] = []
     for row_id, action in operations:
-        row = get_tag_label_by_id(db, row_id)
+        row = rows_by_id.get(row_id)
         if row is None or row.file_id != file_id:
             missing.append(str(row_id))
         else:
@@ -248,18 +292,31 @@ def batch_patch_tag_labels(
     return [row for row, _ in to_update]
 
 
-def add_user_tag_label(db: Session, file_id: uuid.UUID, kind: TagKind, value: str) -> TagLabel:
-    row = TagLabel(
-        file_id=file_id,
-        kind_id=kind.id,
-        value=value,
-        source="user",
-        status="confirmed",
+def upsert_user_tag_label(
+    db: Session, file_id: uuid.UUID, kind_id: uuid.UUID, value: str
+) -> tuple[TagLabel, bool]:
+    """Idempotent manual add (#50), tag facet -- see upsert_user_type_label for
+    the source/status split and race-elimination rationale.
+
+    Conflict target is the case-insensitive expression index from #49
+    (ix_tag_labels_file_kind_value_lower): "Berlin" and "berlin" collide here
+    even though value itself is stored as-is, un-normalized.
+    """
+    stmt = (
+        pg_insert(TagLabel)
+        .values(file_id=file_id, kind_id=kind_id, value=value, source="user", status="confirmed")
+        .on_conflict_do_update(
+            index_elements=[TagLabel.file_id, TagLabel.kind_id, func.lower(TagLabel.value)],
+            set_={"status": "confirmed", "updated_at": func.now()},
+        )
+        .returning(TagLabel, literal_column("(xmax = 0)").label("inserted"))
+        .execution_options(populate_existing=True)
     )
-    db.add(row)
+    result = db.execute(stmt).one()
+    row, inserted = result[0], result.inserted
     db.commit()
     db.refresh(row)
-    return row
+    return row, inserted
 
 
 def remove_tag_label(db: Session, row: TagLabel) -> None:
