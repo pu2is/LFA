@@ -1,21 +1,20 @@
 """Tests for labeling.service.normalize_label_name, and for merge.write_type_
-candidates' atomicity (#53).
+candidates' (#53) and write_tag_candidates' (#54) atomicity.
 
 merge.py's other write functions are covered elsewhere: write_initial_
 candidates has no remaining caller (kept per #45's scope-out, not tested
-further); select_kinds/write_tag_candidates are covered in
-test_suggest_labels.py and test_suggest_labels_augment.py, since ADR-0001's
-flows make them meaningful only in sequence, not in isolation.
+further); select_kinds is covered in test_suggest_labels.py, since ADR-0001's
+flow makes it meaningful only in sequence, not in isolation.
 """
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 
 from app.modules.files.models import File, RegisteredPath
-from app.modules.labeling.merge import write_type_candidates
-from app.modules.labeling.models import TypeLabel, TypeLabelFile
-from app.modules.labeling.prompts import InitialTypeCandidate, InitialTypeSuggestionOutput
-from app.modules.labeling.service import normalize_label_name
+from app.modules.labeling.merge import write_tag_candidates, write_type_candidates
+from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
+from app.modules.labeling.prompts import InitialTypeCandidate, InitialTypeSuggestionOutput, TagValuesOutput
+from app.modules.labeling.service import normalize_label_name, upsert_user_tag_label
 
 
 def test_normalize_label_name_replaces_spaces_with_underscores():
@@ -95,3 +94,81 @@ def test_write_type_candidates_inserts_non_conflicting_rows_only(db):
 
     assert len(rows) == 1
     assert rows[0].type_label_id == contract.id
+
+
+# --------------------------------------------------------------------------- #
+# write_tag_candidates atomicity (#54)
+# --------------------------------------------------------------------------- #
+
+def test_write_tag_candidates_survives_a_racing_duplicate_insert(db):
+    """#54: the old SELECT-then-INSERT let two concurrent writers (e.g.
+    overlapping suggest_labels/augment runs on the same file) both see "not
+    yet present" and race to insert the same (file_id, kind_id, lower(value))
+    row -- the loser's commit then crashed on the UNIQUE index. INSERT ...
+    ON CONFLICT DO NOTHING makes this a structural non-issue, simulated here
+    by re-running the write with overlapping output -- same convention as
+    #53/#51."""
+    file = _file(db)
+    kind = TagKind(name="person")
+    db.add(kind)
+    db.commit()
+    db.refresh(kind)
+
+    output = TagValuesOutput(values=["Angela Merkel"])
+
+    first = write_tag_candidates(db, file.id, kind, output)
+    second = write_tag_candidates(db, file.id, kind, output)  # simulated racing writer
+
+    assert len(first) == 1
+    assert first[0].value == "Angela Merkel"
+    assert second == []  # conflicting insert silently skipped -- no IntegrityError
+
+    rows = list(db.scalars(select(TagLabel).where(TagLabel.file_id == file.id, TagLabel.kind_id == kind.id)))
+    assert len(rows) == 1
+
+
+def test_write_tag_candidates_survives_a_case_variant_race(db):
+    """#49's case-insensitive index applies to the race too: a stale
+    existing_values snapshot (e.g. augment's upfront query, taken before a
+    concurrent writer's commit) must not defeat ON CONFLICT -- "berlin"
+    racing against an already-committed "Berlin" is still a no-op, not a
+    crash, even though the (deliberately stale) existing_values passed in
+    here doesn't know about it."""
+    file = _file(db)
+    kind = TagKind(name="place")
+    db.add(kind)
+    db.commit()
+    db.refresh(kind)
+
+    write_tag_candidates(db, file.id, kind, TagValuesOutput(values=["Berlin"]))
+
+    # existing_values intentionally stale/empty -- mirrors a caller whose
+    # upfront snapshot predates the other writer's commit.
+    rows = write_tag_candidates(db, file.id, kind, TagValuesOutput(values=["berlin"]), existing_values=set())
+
+    assert rows == []
+    all_rows = list(db.scalars(select(TagLabel).where(TagLabel.file_id == file.id, TagLabel.kind_id == kind.id)))
+    assert len(all_rows) == 1
+    assert all_rows[0].value == "Berlin"
+
+
+def test_write_tag_candidates_survives_a_concurrent_manual_upsert(db):
+    """#54: a user manually confirming a tag via upsert_user_tag_label
+    (#50's atomic upsert) while an augment/initial job's write_tag_candidates
+    is mid-flight for the same (file, kind, value) must not fail the job --
+    whichever commits second just finds nothing left to insert."""
+    file = _file(db)
+    kind = TagKind(name="organization")
+    db.add(kind)
+    db.commit()
+    db.refresh(kind)
+
+    upsert_user_tag_label(db, file.id, kind.id, "Deutsche Bank")  # simulated concurrent manual add
+
+    rows = write_tag_candidates(db, file.id, kind, TagValuesOutput(values=["Deutsche Bank"]))
+
+    assert rows == []  # no IntegrityError -- the user's row already won
+    all_rows = list(db.scalars(select(TagLabel).where(TagLabel.file_id == file.id, TagLabel.kind_id == kind.id)))
+    assert len(all_rows) == 1
+    assert all_rows[0].source == "user"
+    assert all_rows[0].status == "confirmed"

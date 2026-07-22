@@ -3,7 +3,7 @@ dedup against the existing catalog / existing rows."""
 import logging
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -105,17 +105,24 @@ def write_tag_candidates(
     ix_tag_labels_file_kind_value_lower index. Only blank values are dropped
     outright. An empty output simply writes nothing; no special-casing needed.
 
-    Idempotent against (file_id, kind_id, lower(value)): a retried/re-
-    triggered run (or augment re-suggesting a value already there, including
-    a case variant) is a no-op, never a UNIQUE-constraint crash. This is also
-    exactly augment's own append-only requirement (docs/workflow/01c-file-
-    label-augment.md) -- confirmed/rejected/suggested rows already in the DB
-    are never touched, since only genuinely-new values reach the INSERT below.
+    Idempotent against (file_id, kind_id, lower(value)) via INSERT ... ON
+    CONFLICT DO NOTHING ... RETURNING (#54): the prior SELECT-then-INSERT let
+    concurrent writers -- two overlapping suggest_labels/augment runs, or a
+    user's upsert_user_tag_label landing mid-augment -- both read "not yet
+    present" and race to insert the same row, crashing the loser's commit on
+    the UNIQUE index despite this function's documented idempotency. This is
+    also exactly augment's own append-only requirement (docs/workflow/01c-
+    file-label-augment.md) -- confirmed/rejected/suggested rows already in
+    the DB are never touched, since a conflicting insert is simply dropped.
 
     existing_values: pass this (file, kind)'s current values, lowercased, if
     the caller already has them loaded (augment does, from its own upfront
-    query) to skip the redundant re-query; omitted (initial's Call 3, which
-    has no prior read of tag_labels) queries and lowercases them here.
+    query) to skip a redundant re-query; omitted (initial's Call 3, which has
+    no prior read of tag_labels) queries and lowercases them here. This is a
+    pure optimization -- fewer candidate rows sent to the INSERT -- never the
+    source of correctness: it can be stale the instant another writer
+    commits after it was read, which is exactly what ON CONFLICT guards
+    against.
     """
     if existing_values is None:
         existing_values = {
@@ -124,8 +131,8 @@ def write_tag_candidates(
                 select(TagLabel.value).where(TagLabel.file_id == file_id, TagLabel.kind_id == kind.id)
             )
         }
-    rows: list[TagLabel] = []
     seen: set[str] = set()
+    values: list[dict] = []
 
     for raw_value in output.values:
         value = raw_value.strip()
@@ -133,10 +140,17 @@ def write_tag_candidates(
         if not value or value_lower in seen or value_lower in existing_values:
             continue
         seen.add(value_lower)
+        values.append({"file_id": file_id, "kind_id": kind.id, "value": value, "source": "llm", "status": "suggested"})
 
-        row = TagLabel(file_id=file_id, kind_id=kind.id, value=value, source="llm", status="suggested")
-        db.add(row)
-        rows.append(row)
+    if not values:
+        return []
 
+    stmt = (
+        pg_insert(TagLabel)
+        .values(values)
+        .on_conflict_do_nothing(index_elements=[TagLabel.file_id, TagLabel.kind_id, func.lower(TagLabel.value)])
+        .returning(TagLabel)
+    )
+    rows = list(db.scalars(stmt))
     db.commit()
     return rows
