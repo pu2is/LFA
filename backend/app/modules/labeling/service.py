@@ -322,3 +322,48 @@ def upsert_user_tag_label(
 def remove_tag_label(db: Session, row: TagLabel) -> None:
     db.delete(row)
     db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Smart Search facet query (WF2a, ADR-0002a D3 / #56)
+# --------------------------------------------------------------------------- #
+
+def get_tag_facets(
+    db: Session, type_label_ids: list[uuid.UUID] | None = None
+) -> list[tuple[TagKind, list[str]]]:
+    """Confirmed tag values that occur in the candidate file set, grouped by
+    kind. Candidate set = all files if type_label_ids is empty, else files
+    with a confirmed type_labels_files row for one of the given type ids.
+
+    Case-insensitive dedup (#56 AC): "Berlin" and "berlin" collapse into one
+    value. DISTINCT ON (kind_id, lower(value)) picks a deterministic
+    representative -- the byte-order-smallest raw value for that (kind,
+    lower(value)) pair -- instead of an arbitrary DB visitation order. The
+    tie-break explicitly COLLATEs "C" so the choice doesn't depend on the
+    Postgres cluster's default locale (e.g. some locales would otherwise
+    sort "berlin" before "Berlin"). The same ORDER BY also gives
+    alphabetical values per kind for free.
+    """
+    conditions = [TagLabel.status == "confirmed"]
+    if type_label_ids:
+        candidate_files = select(TypeLabelFile.file_id).where(
+            TypeLabelFile.status == "confirmed",
+            TypeLabelFile.type_label_id.in_(type_label_ids),
+        )
+        conditions.append(TagLabel.file_id.in_(candidate_files))
+
+    stmt = (
+        select(TagLabel.kind_id, TagLabel.value)
+        .distinct(TagLabel.kind_id, func.lower(TagLabel.value))
+        .where(*conditions)
+        .order_by(TagLabel.kind_id, func.lower(TagLabel.value), TagLabel.value.collate("C"))
+    )
+    values_by_kind: dict[uuid.UUID, list[str]] = {}
+    for kind_id, value in db.execute(stmt):
+        values_by_kind.setdefault(kind_id, []).append(value)
+
+    if not values_by_kind:
+        return []
+
+    kinds = {k.id: k for k in db.scalars(select(TagKind).where(TagKind.id.in_(values_by_kind.keys())))}
+    return [(kinds[kind_id], values) for kind_id, values in values_by_kind.items()]

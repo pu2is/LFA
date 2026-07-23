@@ -7,6 +7,7 @@ from app.modules.files.routes import router as paths_router
 from app.modules.jobs.routes import router as jobs_router
 from app.modules.labeling.routes import router as labels_router
 from app.modules.scans.routes import router as scans_router
+from app.modules.search.routes import router as search_router
 from app.shared.config import settings
 from app.shared.database import Base, get_db
 
@@ -24,6 +25,7 @@ app.include_router(labels_router)
 app.include_router(scans_router)
 app.include_router(jobs_router)
 app.include_router(events_router)
+app.include_router(search_router)
 
 
 @app.get("/health")
