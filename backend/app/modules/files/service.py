@@ -6,6 +6,7 @@ from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
+from app.modules.files.schemas import FileRead
 from app.modules.jobs.models import Job
 
 # Job types surfaced in the files list as "processing status": ingest and
@@ -13,6 +14,16 @@ from app.modules.jobs.models import Job
 # has its own files.embedding_status column; scan is path-level -- Job.file_id
 # is NULL for scans, see ck_jobs_target -- so it can't join to a file anyway).
 _FILE_STATUS_JOB_TYPES = ("ingest", "label")
+
+# WF2a (#57): columns POST /search/files may sort by. file_created_at is the
+# only nullable one (see File model) -- driving list_files_by_ids's NULLS LAST.
+_SORTABLE_COLUMNS = {
+    "filename": File.filename,
+    "file_type": File.file_type,
+    "file_size": File.file_size,
+    "file_created_at": File.file_created_at,
+    "file_modified_at": File.file_modified_at,
+}
 
 
 def get_path_by_value(db: Session, path: str) -> RegisteredPath | None:
@@ -85,10 +96,10 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
     return db.scalar(select(File).where(File.full_path == full_path))
 
 
-def list_files(
-    db: Session, path_id: uuid.UUID | None = None
-) -> list[tuple[File, str | None, str | None, str | None]]:
-    """List files, each joined with its most recent ingest-or-label job.
+def _files_with_processing_status_stmt():
+    """Base SELECT: every File row joined with its most recent ingest-or-label
+    job's status/error_message/type. Shared by list_files and
+    list_files_by_ids so both get the same processing-status enrichment.
 
     One LATERAL join per file (not one scalar subquery per projected column)
     so Postgres runs the "latest job" lookup once and reuses the
@@ -103,15 +114,64 @@ def list_files(
         .correlate(File)
         .lateral("latest_job")
     )
-    stmt = select(
+    return select(
         File,
         latest_job.c.status.label("processing_job_status"),
         latest_job.c.error_message.label("processing_error_message"),
         latest_job.c.type.label("processing_job_type"),
     ).outerjoin(latest_job, true())
+
+
+def list_files(
+    db: Session, path_id: uuid.UUID | None = None
+) -> list[tuple[File, str | None, str | None, str | None]]:
+    stmt = _files_with_processing_status_stmt()
     if path_id is not None:
         stmt = stmt.where(File.path_id == path_id)
     return list(db.execute(stmt))
+
+
+def to_file_reads(rows: list[tuple[File, str | None, str | None, str | None]]) -> list[FileRead]:
+    """Shape (File, processing_job_status, processing_error_message,
+    processing_job_type) rows -- the shared shape produced by
+    _files_with_processing_status_stmt -- into FileRead objects."""
+    return [
+        FileRead.model_validate(file).model_copy(update={
+            "processing_job_status": job_status,
+            "processing_error_message": error_msg,
+            "processing_job_type": job_type,
+        })
+        for file, job_status, error_msg, job_type in rows
+    ]
+
+
+def list_files_by_ids(
+    db: Session,
+    file_ids: set[uuid.UUID] | None,
+    *,
+    sort_by: str = "file_modified_at",
+    sort_order: str = "desc",
+) -> list[FileRead]:
+    """WF2a (ADR-0002a D3 / #57): fetch files narrowed to file_ids (None = no
+    restriction, i.e. an unfiltered search) with the same processing-status
+    enrichment as list_files, sorted by a caller-chosen column.
+
+    NULLS LAST + id tiebreak: file_created_at is the only nullable sortable
+    column, so without NULLS LAST an ascending sort would put never-populated
+    dates first (Postgres's default), burying real ones behind them. The id
+    tiebreak makes ordering deterministic across repeated calls when the sort
+    column has duplicate values, instead of an arbitrary/unstable order.
+    """
+    if file_ids is not None and not file_ids:
+        return []
+
+    column = _SORTABLE_COLUMNS[sort_by]
+    order = column.asc() if sort_order == "asc" else column.desc()
+
+    stmt = _files_with_processing_status_stmt().order_by(order.nulls_last(), File.id)
+    if file_ids is not None:
+        stmt = stmt.where(File.id.in_(file_ids))
+    return to_file_reads(list(db.execute(stmt)))
 
 
 def count_files_by_path(db: Session, path_id: uuid.UUID) -> int:

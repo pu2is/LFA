@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import func, literal_column, select
+from sqlalchemy import func, literal_column, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -367,3 +367,49 @@ def get_tag_facets(
 
     kinds = {k.id: k for k in db.scalars(select(TagKind).where(TagKind.id.in_(values_by_kind.keys())))}
     return [(kinds[kind_id], values) for kind_id, values in values_by_kind.items()]
+
+
+# --------------------------------------------------------------------------- #
+# Smart Search file filter (WF2a, ADR-0002a D3 / #57)
+# --------------------------------------------------------------------------- #
+
+def get_file_ids_by_confirmed_types(db: Session, type_label_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """file_ids with a confirmed type_labels_files row for one of type_label_ids.
+
+    Caller (search/routes.py) decides whether an empty type_label_ids means
+    "no type filter" (don't call this at all) vs. an empty *result* meaning
+    "filter applied, nothing matched" -- this function itself just answers
+    the query for whatever ids it's given.
+    """
+    if not type_label_ids:
+        return set()
+
+    stmt = (
+        select(TypeLabelFile.file_id)
+        .where(TypeLabelFile.status == "confirmed", TypeLabelFile.type_label_id.in_(type_label_ids))
+        .distinct()
+    )
+    return set(db.scalars(stmt))
+
+
+def get_file_ids_by_confirmed_tags(db: Session, tags: list[tuple[uuid.UUID, str]]) -> set[uuid.UUID]:
+    """file_ids with a confirmed tag_labels row matching one of (kind_id, value).
+
+    Case-insensitive on value (#57 AC): matches "Berlin" against a stored
+    "berlin" and vice versa, consistent with #56's facet dedup and ADR-0001
+    #49's file-scoped case-insensitive tag uniqueness.
+    """
+    if not tags:
+        return set()
+
+    stmt = (
+        select(TagLabel.file_id)
+        .where(
+            TagLabel.status == "confirmed",
+            tuple_(TagLabel.kind_id, func.lower(TagLabel.value)).in_(
+                [(kind_id, value.lower()) for kind_id, value in tags]
+            ),
+        )
+        .distinct()
+    )
+    return set(db.scalars(stmt))
