@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import func, literal_column, select, tuple_
+from sqlalchemy import Select, func, literal_column, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -370,39 +370,45 @@ def get_tag_facets(
 
 
 # --------------------------------------------------------------------------- #
-# Smart Search file filter (WF2a, ADR-0002a D3 / #57)
+# Smart Search file filter (WF2a, ADR-0002a D3 / #57; pushed into subqueries
+# for #58 so files.service can fold them into one query with pagination --
+# see docs/workflow/02a1_smart-search-pagination.md)
 # --------------------------------------------------------------------------- #
 
-def get_file_ids_by_confirmed_types(db: Session, type_label_ids: list[uuid.UUID]) -> set[uuid.UUID]:
-    """file_ids with a confirmed type_labels_files row for one of type_label_ids.
+def get_file_ids_by_confirmed_types_subquery(type_label_ids: list[uuid.UUID]) -> Select:
+    """Unexecuted SELECT of file_ids with a confirmed type_labels_files row
+    for one of type_label_ids -- a scalar subquery for the caller to use as
+    `File.id.in_(this)`, not a materialized set. Doing it this way (instead
+    of running the query here and returning a Python set) lets
+    files.service.list_files_page/count_files fold this filter into their
+    own single query alongside sorting/pagination, instead of pulling every
+    matching id into Python first and intersecting there -- the difference
+    matters once the match count is large (see #58).
 
     Caller (search/routes.py) decides whether an empty type_label_ids means
-    "no type filter" (don't call this at all) vs. an empty *result* meaning
-    "filter applied, nothing matched" -- this function itself just answers
-    the query for whatever ids it's given.
+    "no type filter" (don't call this at all, pass None downstream) vs. an
+    empty *result* meaning "filter applied, nothing matched" -- this
+    function assumes a non-empty type_label_ids; there's no sensible
+    "unrestricted" Select to hand back for the empty case, which is exactly
+    why that decision belongs to the caller instead.
     """
-    if not type_label_ids:
-        return set()
-
-    stmt = (
+    return (
         select(TypeLabelFile.file_id)
         .where(TypeLabelFile.status == "confirmed", TypeLabelFile.type_label_id.in_(type_label_ids))
         .distinct()
     )
-    return set(db.scalars(stmt))
 
 
-def get_file_ids_by_confirmed_tags(db: Session, tags: list[tuple[uuid.UUID, str]]) -> set[uuid.UUID]:
-    """file_ids with a confirmed tag_labels row matching one of (kind_id, value).
+def get_file_ids_by_confirmed_tags_subquery(tags: list[tuple[uuid.UUID, str]]) -> Select:
+    """Unexecuted SELECT of file_ids with a confirmed tag_labels row matching
+    one of (kind_id, value) -- see get_file_ids_by_confirmed_types_subquery
+    for why this returns a subquery rather than a materialized set.
 
     Case-insensitive on value (#57 AC): matches "Berlin" against a stored
     "berlin" and vice versa, consistent with #56's facet dedup and ADR-0001
     #49's file-scoped case-insensitive tag uniqueness.
     """
-    if not tags:
-        return set()
-
-    stmt = (
+    return (
         select(TagLabel.file_id)
         .where(
             TagLabel.status == "confirmed",
@@ -412,4 +418,3 @@ def get_file_ids_by_confirmed_tags(db: Session, tags: list[tuple[uuid.UUID, str]
         )
         .distinct()
     )
-    return set(db.scalars(stmt))

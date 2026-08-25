@@ -1,8 +1,9 @@
 import uuid
 from datetime import datetime
 from pathlib import Path as FsPath
+from typing import Any
 
-from sqlalchemy import func, select, true
+from sqlalchemy import Select, and_, func, or_, select, true
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
@@ -16,7 +17,8 @@ from app.modules.jobs.models import Job
 _FILE_STATUS_JOB_TYPES = ("ingest", "label")
 
 # WF2a (#57): columns POST /search/files may sort by. file_created_at is the
-# only nullable one (see File model) -- driving list_files_by_ids's NULLS LAST.
+# only nullable one (see File model) -- driving list_files_page's NULLS LAST
+# and the extra branch in _keyset_condition.
 _SORTABLE_COLUMNS = {
     "filename": File.filename,
     "file_type": File.file_type,
@@ -24,6 +26,15 @@ _SORTABLE_COLUMNS = {
     "file_created_at": File.file_created_at,
     "file_modified_at": File.file_modified_at,
 }
+
+
+def sortable_column_python_type(sort_by: str) -> type:
+    """Python type of a sort_by column's values (str/int/datetime) -- lets
+    search/routes.py's cursor decode validate a cursor's 'v' against the
+    column it claims to sort by, without hand-maintaining a second list of
+    which sortable columns are which type (#58 fix: that second list is what
+    let a mismatched cursor value reach the DB unvalidated)."""
+    return _SORTABLE_COLUMNS[sort_by].type.python_type
 
 
 def get_path_by_value(db: Session, path: str) -> RegisteredPath | None:
@@ -99,7 +110,7 @@ def get_file_by_full_path(db: Session, full_path: str) -> File | None:
 def _files_with_processing_status_stmt():
     """Base SELECT: every File row joined with its most recent ingest-or-label
     job's status/error_message/type. Shared by list_files and
-    list_files_by_ids so both get the same processing-status enrichment.
+    list_files_page so both get the same processing-status enrichment.
 
     One LATERAL join per file (not one scalar subquery per projected column)
     so Postgres runs the "latest job" lookup once and reuses the
@@ -145,32 +156,105 @@ def to_file_reads(rows: list[tuple[File, str | None, str | None, str | None]]) -
     ]
 
 
-def list_files_by_ids(
-    db: Session,
-    file_ids: set[uuid.UUID] | None,
+def _apply_id_filters(
+    stmt: Select,
     *,
+    type_ids_subquery: Select | None,
+    tag_ids_subquery: Select | None,
+) -> Select:
+    """AND in the (optional) type/tag candidate-set subqueries from
+    labeling.service. Each is an unexecuted SELECT of file_id -- folding
+    them in here means Postgres evaluates the whole filter+sort+page in one
+    query, instead of files.service receiving pre-materialized id sets (see
+    docs/workflow/02a1_smart-search-pagination.md, #58)."""
+    if type_ids_subquery is not None:
+        stmt = stmt.where(File.id.in_(type_ids_subquery))
+    if tag_ids_subquery is not None:
+        stmt = stmt.where(File.id.in_(tag_ids_subquery))
+    return stmt
+
+
+def count_files(
+    db: Session,
+    *,
+    type_ids_subquery: Select | None = None,
+    tag_ids_subquery: Select | None = None,
+) -> int:
+    """WF2a (ADR-0002a D3 / #57, pagination #58): count of files matching the
+    type/tag candidate-set subqueries (both None = every file). Independent
+    of any page/cursor -- always reflects the full filtered set."""
+    stmt = _apply_id_filters(
+        select(func.count()).select_from(File),
+        type_ids_subquery=type_ids_subquery,
+        tag_ids_subquery=tag_ids_subquery,
+    )
+    return db.scalar(stmt)
+
+
+def _keyset_condition(column, cursor_value: Any, cursor_id: uuid.UUID, ascending: bool):
+    """WHERE condition for 'rows strictly after (cursor_value, cursor_id)' in
+    this column's NULLS-LAST order, for seek/keyset pagination.
+
+    file_created_at is the only nullable sortable column, and NULLS LAST
+    means null rows sort after every non-null value regardless of asc/desc --
+    so the condition has to branch on whether the cursor itself already sits
+    in that trailing null group (cursor_value is None: only later nulls,
+    tie-broken by id) or is still among non-null values (cursor_value is not
+    None: rows that progressed past it, OR the same value tie-broken by id,
+    OR the null group entirely -- since once non-null values are exhausted,
+    NULLS LAST puts every null row next regardless of value).
+    """
+    if cursor_value is None:
+        return and_(column.is_(None), File.id > cursor_id)
+
+    same_value_tiebreak = and_(column == cursor_value, File.id > cursor_id)
+    progressed = column > cursor_value if ascending else column < cursor_value
+    return or_(progressed, same_value_tiebreak, column.is_(None))
+
+
+def list_files_page(
+    db: Session,
+    *,
+    type_ids_subquery: Select | None = None,
+    tag_ids_subquery: Select | None = None,
     sort_by: str = "file_modified_at",
     sort_order: str = "desc",
+    cursor: tuple[Any, uuid.UUID] | None = None,
+    limit: int = 50,
 ) -> list[FileRead]:
-    """WF2a (ADR-0002a D3 / #57): fetch files narrowed to file_ids (None = no
-    restriction, i.e. an unfiltered search) with the same processing-status
-    enrichment as list_files, sorted by a caller-chosen column.
+    """WF2a (ADR-0002a D3 / #57, keyset pagination #58): fetch up to
+    limit + 1 rows (the extra row lets the caller detect a next page exists
+    without a separate query) narrowed to the type/tag candidate-set
+    subqueries (both None = every file), sorted by a caller-chosen column,
+    resuming after `cursor` -- the (sort_value, id) of the last item on the
+    previous page; None = first page, i.e. just take the first rows.
 
-    NULLS LAST + id tiebreak: file_created_at is the only nullable sortable
-    column, so without NULLS LAST an ascending sort would put never-populated
-    dates first (Postgres's default), burying real ones behind them. The id
-    tiebreak makes ordering deterministic across repeated calls when the sort
-    column has duplicate values, instead of an arbitrary/unstable order.
+    Seek/keyset pagination, not OFFSET: OFFSET makes Postgres scan and
+    discard every preceding row on each call, so cost grows with page depth.
+    `WHERE (sort_col, id) > (cursor_val, cursor_id)` lets it seek directly
+    via the sort column's index instead, regardless of how deep the page is.
+
+    NULLS LAST: file_created_at is the only nullable sortable column, so
+    without it an ascending sort would put never-populated dates first
+    (Postgres's default), burying real ones behind them. The id tiebreak
+    (both here and in _keyset_condition) makes ordering deterministic when
+    the sort column has duplicate values -- required for pages to stay
+    disjoint, not just for single-query ordering.
     """
-    if file_ids is not None and not file_ids:
-        return []
-
     column = _SORTABLE_COLUMNS[sort_by]
-    order = column.asc() if sort_order == "asc" else column.desc()
+    ascending = sort_order == "asc"
+    order = column.asc() if ascending else column.desc()
 
-    stmt = _files_with_processing_status_stmt().order_by(order.nulls_last(), File.id)
-    if file_ids is not None:
-        stmt = stmt.where(File.id.in_(file_ids))
+    stmt = _apply_id_filters(
+        _files_with_processing_status_stmt(),
+        type_ids_subquery=type_ids_subquery,
+        tag_ids_subquery=tag_ids_subquery,
+    )
+    if cursor is not None:
+        cursor_value, cursor_id = cursor
+        stmt = stmt.where(_keyset_condition(column, cursor_value, cursor_id, ascending))
+
+    stmt = stmt.order_by(order.nulls_last(), File.id).limit(limit + 1)
     return to_file_reads(list(db.execute(stmt)))
 
 
