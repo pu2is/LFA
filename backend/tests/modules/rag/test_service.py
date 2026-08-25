@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.rag.models import FileChunk
-from app.modules.rag.service import chunk_and_store
+from app.modules.rag.service import chunk_and_store, get_chunk_texts
 
 # Long enough to produce multiple chunks (>CHUNK_SIZE chars).
 SAMPLE_TEXT = "This is a sample sentence about document management. " * 30
@@ -61,3 +61,17 @@ def test_chunk_and_store_is_idempotent(db, test_file):
     # Only the second run's rows remain in the database.
     stored = db.scalars(select(FileChunk).where(FileChunk.file_id == test_file.id)).all()
     assert {c.id for c in stored} == second_ids
+
+
+def test_get_chunk_texts_returns_content_in_index_order_and_honors_limit(db, test_file):
+    db.add_all(
+        [
+            FileChunk(file_id=test_file.id, chunk_index=2, content="third"),
+            FileChunk(file_id=test_file.id, chunk_index=0, content="first"),
+            FileChunk(file_id=test_file.id, chunk_index=1, content="second"),
+        ]
+    )
+    db.commit()
+
+    assert get_chunk_texts(db, test_file.id) == ["first", "second", "third"]
+    assert get_chunk_texts(db, test_file.id, limit=2) == ["first", "second"]
