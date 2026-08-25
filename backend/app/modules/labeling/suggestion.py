@@ -22,7 +22,7 @@ from app.modules.labeling.prompts import (
     TagValuesOutput,
 )
 from app.modules.labeling.service import ensure_tag_kind_catalog, ensure_type_catalog
-from app.modules.rag.models import FileChunk
+from app.modules.rag.service import get_chunk_texts
 from app.shared.config import settings
 
 logger = logging.getLogger(__name__)
@@ -68,25 +68,22 @@ def _load_chunks_and_llm(
     llm: BaseChatModel | None,
     max_chunks: int | None,
     temperature: float,
-) -> tuple[list[FileChunk], BaseChatModel | None]:
+) -> tuple[list[str], BaseChatModel | None]:
     """Shared by suggest_labels/suggest_labels_augment: load this file's
-    chunks (capped at max_chunks) and lazily build the ChatOllama instance
-    if the caller didn't inject one. Returns an empty chunk list, not an
+    chunk texts (capped at max_chunks) and lazily build the ChatOllama instance
+    if the caller didn't inject one. Returns an empty text list, not an
     exception, when the file has no chunks -- callers decide what that means.
     """
-    chunk_query = select(FileChunk).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
-    if max_chunks is not None:
-        chunk_query = chunk_query.limit(max_chunks)
-    chunks = list(db.scalars(chunk_query))
+    texts = get_chunk_texts(db, file_id, limit=max_chunks)
 
-    if chunks and llm is None:
+    if texts and llm is None:
         llm = ChatOllama(
             model=settings.ollama_model,
             base_url=settings.ollama_base_url,
             temperature=temperature,
             num_ctx=settings.ollama_num_ctx,
         )
-    return chunks, llm
+    return texts, llm
 
 
 def suggest_labels(
@@ -121,12 +118,12 @@ def suggest_labels(
     types = ensure_type_catalog(db)
     kinds = ensure_tag_kind_catalog(db)
 
-    chunks, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks, temperature=0)
-    if not chunks:
+    texts, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks, temperature=0)
+    if not texts:
         logger.warning("suggest_labels: no chunks found for file %s", file_id)
         return [], []
 
-    text = "\n\n".join(c.content for c in chunks)
+    text = "\n\n".join(texts)
     messages: list[BaseMessage] = []
 
     # --- Call 1 (stage=type, set by run_label before calling this) ---
@@ -230,12 +227,12 @@ def suggest_labels_augment(
     # not behaviorally significant.
     kinds = list(db.scalars(select(TagKind).where(TagKind.id.in_(kind_ids)).order_by(TagKind.name)))
 
-    chunks, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks, temperature=temperature)
-    if not chunks:
+    texts, llm = _load_chunks_and_llm(db, file_id, llm=llm, max_chunks=max_chunks, temperature=temperature)
+    if not texts:
         logger.warning("suggest_labels_augment: no chunks for file %s", file_id)
         return []
 
-    text = "\n\n".join(c.content for c in chunks)
+    text = "\n\n".join(texts)
     structured_llm = llm.with_structured_output(TagValuesOutput)
 
     tag_labels: list[TagLabel] = []

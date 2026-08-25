@@ -19,6 +19,19 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 
 
+def get_chunk_texts(
+    db: Session,
+    file_id: uuid.UUID,
+    *,
+    limit: int | None = None,
+) -> list[str]:
+    """Return a file's chunk contents in document order."""
+    query = select(FileChunk.content).where(FileChunk.file_id == file_id).order_by(FileChunk.chunk_index)
+    if limit is not None:
+        query = query.limit(limit)
+    return list(db.scalars(query))
+
+
 def chunk_and_store(db: Session, file_id: uuid.UUID, text: str) -> list[FileChunk]:
     """Split `text` into chunks and (re)persist them for `file_id`.
 

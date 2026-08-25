@@ -25,6 +25,7 @@ redis_data/
 ollama_data/
 documents/
 uploads/
+portfolio/
 
 # local project notes
 docs/
