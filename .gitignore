@@ -33,6 +33,7 @@ docs/
 # dev frontend (test-only, not shipped)
 dev_frontend/
 
-# claude files
+# local agent instruction files
 CLAUDE.md
+AGENTS.md
 .claude
