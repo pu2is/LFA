@@ -1,6 +1,6 @@
 """Tests for POST /label/files and POST /label/paths endpoints."""
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -12,7 +12,7 @@ from app.main import app
 from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
 from app.modules.labeling import service
-from app.modules.labeling.models import TagKind, TagLabel
+from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
 from app.shared.database import get_db
 from app.shared.queue import JOB_RETRY
 from tests.conftest import mock_rq_job
@@ -121,6 +121,52 @@ def ready_file_with_labels(db: Session):
     yield path, file
 
 
+_INCOMPLETE_INITIAL_FAKE_PATH = "D:/lfa_test_label_routes_incomplete"
+
+
+@pytest.fixture
+def ready_file_with_incomplete_initial_job(db: Session):
+    """A ready file whose initial job's Call 1 (type) succeeded and committed
+    a type_labels_files row, but the job then failed before Call 2/3 ever ran
+    -- the #61 repro. Row presence alone would misroute a retrigger into
+    augment; the fix must catch this via the failed mode=initial job."""
+    path = RegisteredPath(path=_INCOMPLETE_INITIAL_FAKE_PATH)
+    db.add(path)
+    db.flush()
+
+    file = File(
+        path_id=path.id,
+        filename="incomplete.pdf",
+        full_path=f"{_INCOMPLETE_INITIAL_FAKE_PATH}/incomplete.pdf",
+        file_type="pdf",
+        file_size=2048,
+        file_hash="deadbeef" * 8,
+        file_modified_at=datetime.now(timezone.utc),
+        status="ready",
+    )
+    db.add(file)
+    db.flush()
+
+    type_label = TypeLabel(name="lr_test_incomplete_invoice")
+    db.add(type_label)
+    db.flush()
+    db.add(TypeLabelFile(file_id=file.id, type_label_id=type_label.id, source="llm", status="suggested"))
+    db.add(
+        Job(
+            type="label",
+            file_id=file.id,
+            trigger="manual",
+            mode="initial",
+            status="failed",
+            stage="kinds",
+            error_message="LLM timeout on Call 2",
+        )
+    )
+    db.commit()
+    db.refresh(file)
+    yield path, file
+
+
 @pytest.fixture
 def three_ready_files(db: Session):
     """Three ready files under one path, for batch-order/atomicity tests."""
@@ -224,6 +270,120 @@ def test_label_files_batch_assigns_mode_per_file_not_bulk(mock_q, client, ready_
     mode_by_file = {e["file_id"]: e["mode"] for e in resp.json()["enqueued"]}
     assert mode_by_file[str(labeled_file.id)] == "augment"
     assert mode_by_file[str(unlabeled_file.id)] == "initial"
+
+
+# ---------------------------------------------------------------------------
+# POST /label/files — #61: incomplete prior initial job must reroute to
+# initial, not be misrouted into augment just because Call 1's row exists.
+# ---------------------------------------------------------------------------
+
+@patch("app.modules.labeling.routes.label_queue")
+def test_label_files_reroutes_to_initial_after_incomplete_initial_job(
+    mock_q, client, ready_file_with_incomplete_initial_job
+):
+    """Regression for #61: Call 1 (type) succeeded and committed a
+    type_labels_files row, then the initial job failed before Call 2/3. A
+    manual retrigger must redo 'initial', not 'augment' -- augment only ever
+    asks about kinds with existing tag_labels rows, finds none here, and
+    would silently report success having done nothing."""
+    _, file = ready_file_with_incomplete_initial_job
+    mock_q.enqueue.return_value = mock_rq_job()
+
+    resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
+
+    assert resp.status_code == 202
+    data = resp.json()
+    assert len(data["enqueued"]) == 1
+    assert data["enqueued"][0]["mode"] == "initial"
+    assert data["skipped"] == []
+
+
+@patch("app.modules.labeling.routes.label_queue")
+def test_label_files_augment_when_prior_initial_job_succeeded(mock_q, client, db, ready_file_with_labels):
+    """A file whose most recent label job is a fully succeeded 'initial' run
+    must still route to 'augment' on the next manual retrigger -- succeeded
+    status must not be mistaken for 'incomplete'."""
+    _, file = ready_file_with_labels
+    db.add(Job(type="label", file_id=file.id, trigger="manual", mode="initial", status="succeeded"))
+    db.commit()
+    mock_q.enqueue.return_value = mock_rq_job()
+
+    resp = client.post("/label/files", json={"file_ids": [str(file.id)]})
+
+    assert resp.status_code == 202
+    assert resp.json()["enqueued"][0]["mode"] == "augment"
+
+
+# ---------------------------------------------------------------------------
+# service.get_files_with_incomplete_initial_job — #61 mode-detection helper
+# ---------------------------------------------------------------------------
+
+def test_get_files_with_incomplete_initial_job_flags_failed_initial(db: Session):
+    path = RegisteredPath(path=_FAKE_PATH)
+    db.add(path)
+    db.flush()
+
+    file = File(
+        path_id=path.id, filename="failed-initial.pdf", full_path=f"{_FAKE_PATH}/failed-initial.pdf",
+        file_type="pdf", file_size=100, file_hash="gfij-failed" * 4,
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add(file)
+    db.flush()
+    db.add(Job(type="label", file_id=file.id, trigger="manual", mode="initial", status="failed", stage="kinds"))
+    db.commit()
+
+    assert service.get_files_with_incomplete_initial_job(db, [file.id]) == {file.id}
+
+
+def test_get_files_with_incomplete_initial_job_uses_latest_job_only(db: Session):
+    """An older failed initial job followed by a newer succeeded one must not
+    flag the file -- only the SINGLE latest label job decides."""
+    path = RegisteredPath(path=_FAKE_PATH)
+    db.add(path)
+    db.flush()
+
+    file = File(
+        path_id=path.id, filename="retried.pdf", full_path=f"{_FAKE_PATH}/retried.pdf",
+        file_type="pdf", file_size=100, file_hash="gfij-retried" * 4,
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add(file)
+    db.flush()
+
+    older = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db.add(
+        Job(
+            type="label", file_id=file.id, trigger="manual", mode="initial", status="failed",
+            stage="kinds", created_at=older,
+        )
+    )
+    db.add(Job(type="label", file_id=file.id, trigger="manual", mode="initial", status="succeeded"))
+    db.commit()
+
+    assert service.get_files_with_incomplete_initial_job(db, [file.id]) == set()
+
+
+def test_get_files_with_incomplete_initial_job_ignores_files_without_jobs(db: Session):
+    """Rows added directly (e.g. a manual tag, no Job row at all) must not be
+    flagged -- absence of job history means "nothing to redo", not "incomplete"."""
+    path = RegisteredPath(path=_FAKE_PATH)
+    db.add(path)
+    db.flush()
+
+    file = File(
+        path_id=path.id, filename="no-job.pdf", full_path=f"{_FAKE_PATH}/no-job.pdf",
+        file_type="pdf", file_size=100, file_hash="gfij-nojob" * 4,
+        file_modified_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add(file)
+    db.commit()
+
+    assert service.get_files_with_incomplete_initial_job(db, [file.id]) == set()
+
+
+def test_get_files_with_incomplete_initial_job_empty_input_returns_empty_set(db: Session):
+    assert service.get_files_with_incomplete_initial_job(db, []) == set()
 
 
 # ---------------------------------------------------------------------------

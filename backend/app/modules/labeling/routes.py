@@ -93,12 +93,18 @@ def _enqueue_label_jobs(
     # per file -- see #47 code review.
     labeled_file_ids = service.get_files_with_type_or_tag_labels(db, [f.id for f in files])
 
+    # #61: a labeled file whose most recent initial-mode job never finished
+    # (Call 1 committed a type row, Call 2/3 crashed) must still route back
+    # to initial, not augment -- only worth checking the subset that row
+    # presence alone would otherwise send to augment.
+    incomplete_initial_ids = service.get_files_with_incomplete_initial_job(db, list(labeled_file_ids))
+
     for file in files:
         if file.status != "ready":
             skipped.append(LabelJobSkipped(file_id=file.id, reason=f"status is '{file.status}', not 'ready'"))
             continue
 
-        mode = "augment" if file.id in labeled_file_ids else "initial"
+        mode = "augment" if file.id in labeled_file_ids and file.id not in incomplete_initial_ids else "initial"
 
         job = Job(type="label", file_id=file.id, trigger="manual", mode=mode)
         db.add(job)

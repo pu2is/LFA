@@ -4,6 +4,7 @@ from sqlalchemy import Select, func, literal_column, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.modules.jobs.models import Job
 from app.modules.labeling.models import TagKind, TagLabel, TypeLabel, TypeLabelFile
 from app.modules.labeling.presets import TAG_KIND_PRESETS, TYPE_LABEL_PRESETS
 
@@ -72,6 +73,44 @@ def get_files_with_type_or_tag_labels(db: Session, file_ids: list[uuid.UUID]) ->
     typed = set(db.scalars(select(TypeLabelFile.file_id).where(TypeLabelFile.file_id.in_(file_ids))))
     tagged = set(db.scalars(select(TagLabel.file_id).where(TagLabel.file_id.in_(file_ids))))
     return typed | tagged
+
+
+def get_files_with_incomplete_initial_job(db: Session, file_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of these file_ids' most recent `type="label"` job was mode=initial
+    but never reached status=succeeded.
+
+    #61: row presence alone (get_files_with_type_or_tag_labels) can't tell
+    "fully completed initial" apart from "Call 1 committed a type_labels_files
+    row, then Call 2/3 crashed" -- both leave rows behind. A file caught in
+    the latter state must be routed back into initial on the next manual
+    retrigger; augment only ever asks about kinds that already have
+    tag_labels rows, so it can't recover the kinds Call 2/3 never reached,
+    and would silently report success having done nothing (run_label treats
+    augment's empty return as a normal completion).
+
+    Keyed off each file's SINGLE latest label job (DISTINCT ON, ordered by
+    created_at desc) rather than "any failed job ever": a file whose old
+    initial job failed but was later completed by a newer one must not be
+    flagged just because a failure exists somewhere in its history.
+    """
+    if not file_ids:
+        return set()
+
+    latest_label_job = (
+        select(Job.file_id, Job.mode, Job.status)
+        .distinct(Job.file_id)
+        .where(Job.type == "label", Job.file_id.in_(file_ids))
+        .order_by(Job.file_id, Job.created_at.desc())
+    ).subquery()
+
+    return set(
+        db.scalars(
+            select(latest_label_job.c.file_id).where(
+                latest_label_job.c.mode == "initial",
+                latest_label_job.c.status != "succeeded",
+            )
+        )
+    )
 
 
 # --------------------------------------------------------------------------- #
