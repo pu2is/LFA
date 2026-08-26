@@ -1,7 +1,12 @@
-"""Tests for POST /paths nested-path registration rules (#38)."""
+"""Tests for POST /paths nested-path registration rules (#38) and the
+advisory lock guarding concurrent path mutations (#62)."""
 from pathlib import Path
 
+from sqlalchemy import text
+
+from app.modules.files import service
 from app.modules.files.models import RegisteredPath
+from app.shared.database import SessionLocal
 
 
 def _register(client, path: Path):
@@ -95,3 +100,36 @@ def test_unrelated_sibling_paths_unaffected(client, db, tmp_path):
     row_b = db.get(RegisteredPath, resp_b.json()["id"])
     assert row_a.parent_path_id is None
     assert row_b.parent_path_id is None
+
+
+def test_acquire_path_mutation_lock_is_mutually_exclusive_across_sessions():
+    """#62: two concurrent path-mutation requests must never both pass the
+    ancestor/duplicate check before either commits (the root cause of the
+    `/a` + `/a/b` nesting race). Uses two independent sessions/connections
+    from SessionLocal rather than the shared `client`/`db` fixtures --
+    those two route every request through one connection wrapped in a
+    single outer transaction (see conftest.py's `db` fixture), so they
+    can't model two backends actually contending for the same advisory
+    lock. `pg_try_advisory_xact_lock` (non-blocking) makes the assertion
+    deterministic instead of racing real thread timing against a blocking
+    call."""
+    session_a = SessionLocal()
+    session_b = SessionLocal()
+    try:
+        service.acquire_path_mutation_lock(session_a)  # holds the lock, uncommitted
+
+        still_held = session_b.execute(
+            text("SELECT pg_try_advisory_xact_lock(hashtext('lfa:paths:mutation'))")
+        ).scalar()
+        assert still_held is False
+
+        session_a.rollback()  # releases it -- pg_advisory_xact_lock is tied to the transaction
+
+        now_available = session_b.execute(
+            text("SELECT pg_try_advisory_xact_lock(hashtext('lfa:paths:mutation'))")
+        ).scalar()
+        assert now_available is True
+    finally:
+        session_a.close()
+        session_b.rollback()
+        session_b.close()
