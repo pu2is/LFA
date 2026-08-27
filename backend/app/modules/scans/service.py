@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 from app.modules.files import service as files_service
 from app.modules.files.models import File
 from app.modules.jobs.models import Job
-from app.modules.jobs.service import mark_failed, mark_running
-from app.modules.scans import discovery
+from app.modules.jobs.service import mark_failed, mark_progress, mark_running
+from app.modules.scans import discovery, rescan
 from app.shared.events import publish_job_status
 
 
@@ -93,3 +93,78 @@ def run_scan(db: Session, scan_id: uuid.UUID) -> tuple[Job, list[Job]]:
             db.refresh(job)
 
     return scan_job, ingest_jobs
+
+
+def get_rescan(db: Session, scan_id: uuid.UUID) -> Job | None:
+    job = db.get(Job, scan_id)
+    if job is not None and (job.type != "scan" or job.mode != "rescan"):
+        return None
+    return job
+
+
+def run_rescan(db: Session, scan_id: uuid.UUID) -> Job:
+    """Run one global Rescan (WF1b, ADR-0001b): inventory -> diff -> apply,
+    each phase's start recorded as job.stage before it runs. An inventory or
+    diff failure (an unreadable root, a file that kept changing mid-hash)
+    fails the job with zero manifest changes (D2); an apply failure rolls
+    back the whole transaction (D6). Neither is resumable -- a fresh Rescan
+    is the recovery path for both, same as a plain scan failure.
+
+    Returns before fan-out: enqueueing the child ingest jobs this creates is
+    tasks.py's job, since that's D6's separate, resumable stage.
+    """
+    scan_job = db.get(Job, scan_id)
+    if scan_job is None:
+        raise ValueError(f"Job {scan_id} not found")
+
+    # ADR-0001b D1: the registered path set is fixed once, here, at the start
+    # of the run -- not re-queried per root during the walk.
+    registered_paths = files_service.list_paths(db)
+    mark_running(db, scan_job)
+
+    scan_job.stage = "inventory"
+    mark_progress(db, scan_job)
+    try:
+        inventory = rescan.build_inventory(registered_paths)
+    except OSError as exc:
+        mark_failed(db, scan_job, exc)
+        return scan_job
+
+    scan_job.stage = "diff"
+    mark_progress(db, scan_job)
+    current_files = list(db.scalars(select(File)))
+    try:
+        diff = rescan.diff_inventory(inventory, current_files)
+    except OSError as exc:
+        mark_failed(db, scan_job, exc)
+        return scan_job
+
+    scan_job.stage = "apply"
+    mark_progress(db, scan_job)
+    try:
+        rescan.apply_diff(db, scan_job, diff, registered_paths)
+        scan_job.stage = "fan_out"
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        mark_failed(db, scan_job, exc)
+        return scan_job
+
+    publish_job_status(scan_job)
+    return scan_job
+
+
+def get_pending_fan_out_jobs(db: Session, scan_job: Job) -> list[Job]:
+    """Child ingest jobs for this Rescan that still need enqueueing (ADR-0001b
+    D6). rq_job_id IS NULL covers both the first fan-out attempt and a
+    resumed one uniformly: apply_diff creates every child job row up front
+    but never enqueues them itself, so "pending" always just means "not
+    enqueued yet", regardless of which attempt is asking.
+    """
+    return list(db.scalars(
+        select(Job).where(
+            Job.parent_job_id == scan_job.id,
+            Job.type == "ingest",
+            Job.rq_job_id.is_(None),
+        )
+    ))

@@ -1,18 +1,27 @@
-"""Pure inventory/diff/matching engine for Global Rescan (WF1b, ADR-0001b
-D2/D3). Produces an in-memory classification of the full filesystem
-inventory against the current `files` manifest -- no database writes here;
-applying the result to `files`/`file_events`/`file_match_candidates` is #67.
+"""Inventory/diff/matching engine plus apply for Global Rescan (WF1b,
+ADR-0001b D2/D3/D6). build_inventory/diff_inventory produce an in-memory
+classification of the full filesystem inventory against the current `files`
+manifest with no database writes; apply_diff is the only function here that
+writes to the database, applying that classification to
+`files`/`file_events`/`file_match_candidates` in one caller-managed
+transaction.
 """
 
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import Session
+
 from app.modules.files.models import File, RegisteredPath
+from app.modules.jobs.models import Job
+from app.modules.labeling.service import get_files_with_type_or_tag_labels
 from app.modules.processing import cleaning, extraction
 from app.modules.scans import discovery, text_signature
+from app.modules.scans.models import FileEvent, FileMatchCandidate
 
 # ADR-0001b D3 step 5, metadata narrowing: how far a candidate's file_size may
 # be from the added file's size before it is cheap-filtered out, pre-text-
@@ -364,3 +373,206 @@ def _match_fuzzy_candidates(
         ))
 
     return candidates
+
+
+def apply_diff(
+    db: Session,
+    scan_job: Job,
+    diff: RescanDiff,
+    registered_paths: list[RegisteredPath],
+) -> None:
+    """Apply a RescanDiff to the database (ADR-0001b D6): `files` mutations,
+    `file_events`, `file_match_candidates`, child ingest job rows, and every
+    registered path's `last_scanned_at`, all through this one call. Does not
+    commit and does not touch `scan_job.stage` -- the caller
+    (service.run_rescan) commits once so the whole apply is atomic, and owns
+    job.stage transitions itself.
+
+    `file_events`/`file_match_candidates` are written via INSERT ... ON
+    CONFLICT DO NOTHING against their (scan_id, ...) unique constraints, so
+    calling this twice for the same scan_id can never double-write an event
+    or candidate -- even though the documented recovery path for an apply
+    failure is a fresh Rescan (D6), not retrying this same call.
+    """
+    now = datetime.now(timezone.utc)
+
+    review_candidates = [item.file for item in diff.modified] + [item.file for item in diff.moved_modified]
+    needs_review = get_files_with_type_or_tag_labels(db, [file.id for file in review_candidates])
+
+    for item in diff.unchanged:
+        _refresh_metadata(item.file, item.inventory)
+        _apply_recovery_if_missing(db, scan_job, item.file, item.inventory)
+
+    for item in diff.metadata_refreshed:
+        _refresh_metadata(item.file, item.inventory)
+        _apply_recovery_if_missing(db, scan_job, item.file, item.inventory)
+
+    for item in diff.modified:
+        file = item.file
+        from_hash = file.file_hash
+        _refresh_metadata(file, item.inventory)
+        file.file_hash = item.new_hash
+        file.status = "discovered"
+        file.embedding_status = "pending"
+        if file.id in needs_review:
+            file.labels_need_review = True
+        _write_event(
+            db, scan_id=scan_job.id, file_id=file.id, event_type="modified",
+            from_path=item.inventory.full_path, to_path=item.inventory.full_path,
+            from_hash=from_hash, to_hash=item.new_hash, match_method=item.match_method,
+        )
+        db.add(Job(type="ingest", file_id=file.id, parent_job_id=scan_job.id, trigger="scan"))
+
+    for item in diff.moved:
+        file = item.file
+        from_path = file.full_path
+        was_missing = file.status == "missing"
+        _refresh_metadata(file, item.inventory)
+        if was_missing:
+            file.status = "discovered"
+            file.embedding_status = "pending"
+        _write_event(
+            db, scan_id=scan_job.id, file_id=file.id, event_type="moved",
+            from_path=from_path, to_path=item.inventory.full_path,
+            from_hash=file.file_hash, to_hash=file.file_hash, match_method=item.match_method,
+        )
+        if was_missing:
+            db.add(Job(type="ingest", file_id=file.id, parent_job_id=scan_job.id, trigger="scan"))
+
+    for item in diff.moved_modified:
+        file = item.file
+        from_path = file.full_path
+        from_hash = file.file_hash
+        _refresh_metadata(file, item.inventory)
+        file.file_hash = item.new_hash
+        file.status = "discovered"
+        file.embedding_status = "pending"
+        if file.id in needs_review:
+            file.labels_need_review = True
+        _write_event(
+            db, scan_id=scan_job.id, file_id=file.id, event_type="moved_modified",
+            from_path=from_path, to_path=item.inventory.full_path,
+            from_hash=from_hash, to_hash=item.new_hash, match_method=item.match_method,
+        )
+        db.add(Job(type="ingest", file_id=file.id, parent_job_id=scan_job.id, trigger="scan"))
+
+    for item in diff.missing:
+        file = item.file
+        if file.status == "missing":
+            continue  # already recorded on a prior Rescan -- staying missing isn't a new change
+        from_path = file.full_path
+        from_hash = file.file_hash
+        file.status = "missing"
+        _write_event(
+            db, scan_id=scan_job.id, file_id=file.id, event_type="missing",
+            from_path=from_path, to_path=None, from_hash=from_hash, to_hash=None, match_method=None,
+        )
+
+    for item in diff.added:
+        file_id = uuid.uuid4()
+        db.add(File(
+            id=file_id,
+            path_id=item.inventory.path_id,
+            filename=item.inventory.filename,
+            full_path=item.inventory.full_path,
+            file_type=item.inventory.file_type,
+            file_size=item.inventory.file_size,
+            file_hash=item.file_hash,
+            fs_device_id=item.inventory.fs_device_id,
+            fs_file_id=item.inventory.fs_file_id,
+            file_created_at=item.inventory.file_created_at,
+            file_modified_at=item.inventory.file_modified_at,
+        ))
+        _write_event(
+            db, scan_id=scan_job.id, file_id=file_id, event_type="added",
+            from_path=None, to_path=item.inventory.full_path,
+            from_hash=None, to_hash=item.file_hash, match_method=None,
+        )
+        db.add(Job(type="ingest", file_id=file_id, parent_job_id=scan_job.id, trigger="scan"))
+
+    for candidate in diff.fuzzy_candidates:
+        stmt = (
+            pg_insert(FileMatchCandidate)
+            .values(
+                id=uuid.uuid4(),
+                scan_id=scan_job.id,
+                missing_file_id=candidate.missing_file.id,
+                candidate_path_id=candidate.inventory.path_id,
+                candidate_full_path=candidate.inventory.full_path,
+                candidate_hash=candidate.candidate_hash,
+                candidate_size=candidate.inventory.file_size,
+                candidate_modified_at=candidate.inventory.file_modified_at,
+                similarity_score=candidate.similarity_score,
+            )
+            .on_conflict_do_nothing(index_elements=[
+                FileMatchCandidate.scan_id,
+                FileMatchCandidate.missing_file_id,
+                FileMatchCandidate.candidate_full_path,
+            ])
+        )
+        db.execute(stmt)
+
+    for path in registered_paths:
+        path.last_scanned_at = now
+
+
+def _refresh_metadata(file: File, inventory: InventoryFile) -> None:
+    """Refresh the cheap metadata every matched category shares, including
+    fs_device_id/fs_file_id -- ADR-0001b D3's identity matching only starts
+    working once these are backfilled from a live inventory (see #65's
+    bootstrap note in docs/workflow/01d-path-rescan.md), so every category
+    that reuses an existing file row refreshes them, not just the ones with
+    another reason to write.
+    """
+    file.path_id = inventory.path_id
+    file.full_path = inventory.full_path
+    file.filename = inventory.filename
+    file.file_type = inventory.file_type
+    file.file_size = inventory.file_size
+    file.file_created_at = inventory.file_created_at
+    file.file_modified_at = inventory.file_modified_at
+    file.fs_device_id = inventory.fs_device_id
+    file.fs_file_id = inventory.fs_file_id
+
+
+def _apply_recovery_if_missing(db: Session, scan_job: Job, file: File, inventory: InventoryFile) -> None:
+    """unchanged/metadata_refreshed normally write nothing beyond the metadata
+    refresh -- but if `file` was status=missing, disk truth just proved this
+    is the same file (same path, hash confirmed unchanged) via the same
+    hash-backed evidence the rest of D3 relies on elsewhere, so it un-misses
+    it the same way `modified`/`moved` already do for their own cases.
+    """
+    if file.status != "missing":
+        return
+    file.status = "discovered"
+    file.embedding_status = "pending"
+    _write_event(
+        db, scan_id=scan_job.id, file_id=file.id, event_type="recovered",
+        from_path=inventory.full_path, to_path=inventory.full_path,
+        from_hash=file.file_hash, to_hash=file.file_hash, match_method="path",
+    )
+    db.add(Job(type="ingest", file_id=file.id, parent_job_id=scan_job.id, trigger="scan"))
+
+
+def _write_event(
+    db: Session,
+    *,
+    scan_id: uuid.UUID,
+    file_id: uuid.UUID,
+    event_type: str,
+    from_path: str | None,
+    to_path: str | None,
+    from_hash: str | None,
+    to_hash: str | None,
+    match_method: str | None,
+) -> None:
+    stmt = (
+        pg_insert(FileEvent)
+        .values(
+            id=uuid.uuid4(), scan_id=scan_id, file_id=file_id, event_type=event_type,
+            from_path=from_path, to_path=to_path, from_hash=from_hash, to_hash=to_hash,
+            match_method=match_method,
+        )
+        .on_conflict_do_nothing(index_elements=[FileEvent.scan_id, FileEvent.file_id, FileEvent.event_type])
+    )
+    db.execute(stmt)
