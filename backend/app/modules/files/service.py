@@ -4,6 +4,7 @@ from pathlib import Path as FsPath
 from typing import Any
 
 from sqlalchemy import Select, and_, func, or_, select, text, true
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
@@ -116,10 +117,6 @@ def create_path(db: Session, path: str) -> RegisteredPath:
 def delete_path(db: Session, registered_path: RegisteredPath) -> None:
     db.delete(registered_path)
     db.commit()
-
-
-def get_file_by_full_path(db: Session, full_path: str) -> File | None:
-    return db.scalar(select(File).where(File.full_path == full_path))
 
 
 def _files_with_processing_status_stmt():
@@ -293,31 +290,38 @@ def upsert_file(
 ) -> File:
     """Insert a new file row, or refresh filesystem metadata on an existing one.
 
-    Matched by `full_path` (unique). Deliberately leaves `status` and
-    `ocr_applied` untouched on existing rows: those reflect later pipeline
-    stages (OCR, labeling) that a scan must not silently reset, even if the
-    file's content changed (see 03_er-diagram.md "modified" handling).
-    """
-    file = get_file_by_full_path(db, full_path)
-    if file is not None:
-        file.path_id = path_id
-        file.filename = filename
-        file.file_type = file_type
-        file.file_size = file_size
-        file.file_hash = file_hash
-        file.file_created_at = file_created_at
-        file.file_modified_at = file_modified_at
-        return file
+    Matched by `full_path` (unique), via INSERT ... ON CONFLICT DO UPDATE
+    (#63): the old SELECT-then-insert/update let two concurrent upserts for
+    the same full_path (e.g. overlapping rescans of overlapping registered
+    paths) both see "not found" and race to insert, crashing the loser's
+    flush/commit on the unique constraint -- the same TOCTOU pattern already
+    fixed for the labeling module via ON CONFLICT (#53/#54). Deliberately
+    leaves `status` and `ocr_applied` untouched on existing rows: those
+    reflect later pipeline stages (OCR, labeling) that a scan must not
+    silently reset, even if the file's content changed (see 03_er-diagram.md
+    "modified" handling).
 
-    file = File(
-        path_id=path_id,
-        filename=filename,
-        full_path=full_path,
-        file_type=file_type,
-        file_size=file_size,
-        file_hash=file_hash,
-        file_created_at=file_created_at,
-        file_modified_at=file_modified_at,
+    Does not commit: run_scan upserts many files in one loop and commits
+    once at the end (or via mark_failed on a mid-scan OSError), so this
+    stays a plain execute against the caller's transaction, same as before.
+    """
+    metadata = {
+        "path_id": path_id,
+        "filename": filename,
+        "file_type": file_type,
+        "file_size": file_size,
+        "file_hash": file_hash,
+        "file_created_at": file_created_at,
+        "file_modified_at": file_modified_at,
+    }
+    stmt = (
+        pg_insert(File)
+        .values(full_path=full_path, **metadata)
+        .on_conflict_do_update(
+            index_elements=[File.full_path],
+            set_={**metadata, "updated_at": func.now()},
+        )
+        .returning(File)
+        .execution_options(populate_existing=True)
     )
-    db.add(file)
-    return file
+    return db.scalars(stmt).one()
