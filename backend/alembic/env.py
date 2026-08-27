@@ -11,6 +11,7 @@ from app.modules.files import models as files_models  # noqa: F401 - registers R
 from app.modules.jobs import models as jobs_models  # noqa: F401 - registers Job on Base.metadata
 from app.modules.labeling import models as labeling_models  # noqa: F401 - registers TypeLabel, TypeLabelFile, TagKind, TagLabel on Base.metadata
 from app.modules.rag import models as rag_models  # noqa: F401 - registers FileChunk on Base.metadata
+from app.modules.scans import models as scans_models  # noqa: F401 - registers FileEvent, FileMatchCandidate on Base.metadata
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

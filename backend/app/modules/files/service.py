@@ -3,7 +3,7 @@ from datetime import datetime
 from pathlib import Path as FsPath
 from typing import Any
 
-from sqlalchemy import Select, and_, func, or_, select, text, true
+from sqlalchemy import Select, and_, func, or_, select, true
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -36,21 +36,6 @@ def sortable_column_python_type(sort_by: str) -> type:
     which sortable columns are which type (#58 fix: that second list is what
     let a mismatched cursor value reach the DB unvalidated)."""
     return _SORTABLE_COLUMNS[sort_by].type.python_type
-
-
-def acquire_path_mutation_lock(db: Session) -> None:
-    """Block until this transaction holds the exclusive gate for path
-    mutations (#62). Every path-mutating endpoint must call this before any
-    check-then-write (duplicate/ancestor check then insert, or delete), so
-    two concurrent requests can never both pass a check before either
-    commits -- e.g. `/a` and `/a/b` both seeing "no conflict" and registering
-    as unrelated roots (see docs/workflow/00a-path-register.md "已知邊界").
-
-    Uses `pg_advisory_xact_lock`, not the session-scoped `pg_advisory_lock`,
-    so the lock is released automatically on this transaction's commit or
-    rollback -- no manual unlock, and no leak on an exception path.
-    """
-    db.execute(text("SELECT pg_advisory_xact_lock(hashtext('lfa:paths:mutation'))"))
 
 
 def get_path_by_value(db: Session, path: str) -> RegisteredPath | None:

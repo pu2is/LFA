@@ -19,25 +19,44 @@ from app.shared.database import Base
 
 # Per-type job variant (see docs/03_er-diagram.md). Not a DB CHECK constraint
 # on purpose -- adding a new mode is a one-line change here, not a migration.
-VALID_JOB_MODES = frozenset({"default", "initial", "augment", "check"})
+# scan's mode also fixes its target shape (path-level vs. global), which IS
+# DB-enforced -- see ck_jobs_target below.
+VALID_JOB_MODES = frozenset({"default", "initial", "augment", "rescan"})
 
 # Per-type stage progression (see docs/03_er-diagram.md): ingest is
 # extract|clean|chunk; label/mode=initial is type|kinds|tags; label/
-# mode=augment only ever reaches tags; scan/embed leave stage NULL. Same
+# mode=augment only ever reaches tags; scan/mode=rescan is inventory|diff|
+# match|apply|fan_out; scan/mode=initial and embed leave stage NULL. Same
 # app-layer-guard rationale as VALID_JOB_MODES.
-VALID_JOB_STAGES = frozenset({"extract", "clean", "chunk", "type", "kinds", "tags"})
+VALID_JOB_STAGES = frozenset({
+    "extract", "clean", "chunk",
+    "type", "kinds", "tags",
+    "inventory", "diff", "match", "apply", "fan_out",
+})
 
 
 class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "(type = 'scan' AND path_id IS NOT NULL AND file_id IS NULL) OR "
+            "(type = 'scan' AND file_id IS NULL AND ("
+            "(mode = 'initial' AND path_id IS NOT NULL) OR "
+            "(mode = 'rescan' AND path_id IS NULL)"
+            ")) OR "
             "(type <> 'scan' AND file_id IS NOT NULL AND path_id IS NULL)",
             name="ck_jobs_target",
         ),
         Index("ix_jobs_file_type_created", "file_id", "type", text("created_at DESC")),
         Index("ix_jobs_path_created", "path_id", text("created_at DESC")),
+        # ADR-0001b D1: at most one active global Rescan, enforced even
+        # against two concurrent requests racing past an app-level check.
+        Index(
+            "ix_jobs_active_rescan",
+            "type",
+            "mode",
+            unique=True,
+            postgresql_where=text("type = 'scan' AND mode = 'rescan' AND status IN ('queued', 'running')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
