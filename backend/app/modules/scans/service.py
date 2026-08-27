@@ -2,15 +2,20 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.modules.files import service as files_service
-from app.modules.files.models import File
+from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
 from app.modules.jobs.service import mark_failed, mark_progress, mark_running
+from app.modules.labeling.service import clear_all_labels
 from app.modules.scans import discovery, rescan
+from app.modules.scans.models import FileEvent, FileMatchCandidate
 from app.shared.events import publish_job_status
+
+# Same active-status pair jobs/routes.py uses for the processing-table snapshot.
+_ACTIVE_JOB_STATUSES = ("queued", "running")
 
 
 def create_scan(db: Session, path_id: uuid.UUID) -> Job:
@@ -19,6 +24,77 @@ def create_scan(db: Session, path_id: uuid.UUID) -> Job:
     db.commit()
     db.refresh(job)
     return job
+
+
+def list_unscanned_paths(db: Session) -> list[RegisteredPath]:
+    """Registered paths that have never completed an initial scan (ADR-0001b
+    D1 precondition 1) -- POST /rescans rejects until every path has one."""
+    return [p for p in files_service.list_paths(db) if p.last_scanned_at is None]
+
+
+def has_pending_candidates(db: Session) -> bool:
+    """ADR-0001b D1 precondition 2: any unresolved fuzzy recovery candidate,
+    from any past Rescan, blocks a new one."""
+    return db.scalar(select(FileMatchCandidate.id).where(FileMatchCandidate.status == "pending").limit(1)) is not None
+
+
+def has_active_job(db: Session) -> bool:
+    """ADR-0001b D1 precondition 3: any queued/running scan/ingest/label/embed
+    job blocks a new Rescan -- this also covers "no other active Rescan"
+    since that is itself a Job row (the partial unique index on
+    ix_jobs_active_rescan is the DB-level backstop for the same rule)."""
+    return db.scalar(select(Job.id).where(Job.status.in_(_ACTIVE_JOB_STATUSES)).limit(1)) is not None
+
+
+def create_rescan(db: Session) -> Job:
+    job = Job(type="scan", mode="rescan", trigger="manual")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def get_candidate(db: Session, candidate_id: uuid.UUID) -> FileMatchCandidate | None:
+    return db.get(FileMatchCandidate, candidate_id)
+
+
+def get_rescan_event_counts(db: Session, scan_id: uuid.UUID) -> dict[str, int]:
+    stmt = (
+        select(FileEvent.event_type, func.count())
+        .where(FileEvent.scan_id == scan_id)
+        .group_by(FileEvent.event_type)
+    )
+    return {event_type: count for event_type, count in db.execute(stmt)}
+
+
+def count_pending_candidates(db: Session, scan_id: uuid.UUID) -> int:
+    return db.scalar(
+        select(func.count()).select_from(FileMatchCandidate).where(
+            FileMatchCandidate.scan_id == scan_id, FileMatchCandidate.status == "pending",
+        )
+    )
+
+
+def get_last_content_change_event(db: Session, file_id: uuid.UUID) -> FileEvent | None:
+    """Most recent modified/moved_modified event for a file -- the one that
+    set labels_need_review=true -- so label-review can surface its
+    from_hash/to_hash (ADR-0001b D4's "no automatic drift judgment, just show
+    the user what changed")."""
+    return db.scalar(
+        select(FileEvent)
+        .where(FileEvent.file_id == file_id, FileEvent.event_type.in_(("modified", "moved_modified")))
+        .order_by(FileEvent.created_at.desc())
+        .limit(1)
+    )
+
+
+def resolve_label_review(db: Session, file: File, action: str) -> File:
+    if action == "drop":
+        clear_all_labels(db, file.id)
+    file.labels_need_review = False
+    db.commit()
+    db.refresh(file)
+    return file
 
 
 def get_scan(db: Session, scan_id: uuid.UUID) -> Job | None:

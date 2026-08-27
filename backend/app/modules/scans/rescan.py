@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.modules.files.models import File, RegisteredPath
 from app.modules.jobs.models import Job
-from app.modules.labeling.service import get_files_with_type_or_tag_labels
+from app.modules.labeling.service import clear_all_labels, get_files_with_type_or_tag_labels
 from app.modules.processing import cleaning, extraction
 from app.modules.scans import discovery, text_signature
 from app.modules.scans.models import FileEvent, FileMatchCandidate
@@ -146,6 +146,13 @@ class FuzzyCandidate:
     inventory: InventoryFile
     candidate_hash: str
     similarity_score: float
+
+
+class SnapshotMismatch(Exception):
+    """Raised by resolve_candidate when the on-disk file at a candidate's path
+    no longer matches the snapshot captured when the Rescan proposed it
+    (ADR-0001b D5) -- the caller must 409 and ask for a fresh Rescan rather
+    than act on stale evidence."""
 
 
 @dataclass(frozen=True)
@@ -576,3 +583,98 @@ def _write_event(
         .on_conflict_do_nothing(index_elements=[FileEvent.scan_id, FileEvent.file_id, FileEvent.event_type])
     )
     db.execute(stmt)
+
+
+def resolve_candidate(db: Session, candidate: FileMatchCandidate, action: str) -> tuple[File, Job]:
+    """Apply a user's decision on a pending fuzzy recovery candidate (ADR-0001b
+    D5): `keep_labels` and `drop_labels` transplant the missing file's
+    identity onto this path (the latter also clearing its labels);
+    `reject` leaves the missing file alone and creates an independent new
+    file. All three re-verify the file hasn't drifted since the Rescan that
+    proposed it, before making any change -- a SnapshotMismatch here means
+    zero mutation happened, nothing to roll back.
+
+    Re-stats for every action (cheap, catches the common drift); re-hashes
+    only for keep_labels/drop_labels, since those are the ones trusting the
+    new content enough to inherit an existing identity/labels. reject reuses
+    the already-computed candidate_hash once metadata is confirmed unchanged
+    -- the same metadata-implies-hash trust diff_inventory's cheap diff
+    already relies on.
+    """
+    path = Path(candidate.candidate_full_path)
+    try:
+        entry = discovery.describe_inventory_entry(path)
+    except OSError as exc:
+        raise SnapshotMismatch(f"{path} is no longer accessible; re-run Rescan") from exc
+
+    if (entry.file_size, entry.file_modified_at) != (candidate.candidate_size, candidate.candidate_modified_at):
+        raise SnapshotMismatch(f"{path} has changed since this Rescan; re-run Rescan")
+
+    inventory = InventoryFile(
+        path_id=candidate.candidate_path_id,
+        path=path,
+        filename=path.name,
+        file_type=entry.file_type,
+        file_size=entry.file_size,
+        file_created_at=entry.file_created_at,
+        file_modified_at=entry.file_modified_at,
+        fs_device_id=entry.fs_device_id,
+        fs_file_id=entry.fs_file_id,
+    )
+    now = datetime.now(timezone.utc)
+
+    if action in ("keep_labels", "drop_labels"):
+        try:
+            new_hash = discovery.hash_with_retry(path)
+        except OSError as exc:
+            raise SnapshotMismatch(f"{path} is no longer accessible; re-run Rescan") from exc
+        if new_hash != candidate.candidate_hash:
+            raise SnapshotMismatch(f"{path} content has changed since this Rescan; re-run Rescan")
+
+        file = db.get(File, candidate.missing_file_id)
+        from_path = file.full_path
+        from_hash = file.file_hash
+        _refresh_metadata(file, inventory)
+        file.file_hash = new_hash
+        file.status = "discovered"
+        file.embedding_status = "pending"
+        if action == "drop_labels":
+            clear_all_labels(db, file.id)
+        _write_event(
+            db, scan_id=candidate.scan_id, file_id=file.id, event_type="recovered",
+            from_path=from_path, to_path=inventory.full_path,
+            from_hash=from_hash, to_hash=new_hash, match_method="text_similarity_user",
+        )
+        ingest_job = Job(type="ingest", file_id=file.id, parent_job_id=candidate.scan_id, trigger="scan")
+        db.add(ingest_job)
+        candidate.status = "accepted_keep_labels" if action == "keep_labels" else "accepted_drop_labels"
+    else:
+        file_id = uuid.uuid4()
+        file = File(
+            id=file_id,
+            path_id=inventory.path_id,
+            filename=inventory.filename,
+            full_path=inventory.full_path,
+            file_type=inventory.file_type,
+            file_size=inventory.file_size,
+            file_hash=candidate.candidate_hash,
+            fs_device_id=inventory.fs_device_id,
+            fs_file_id=inventory.fs_file_id,
+            file_created_at=inventory.file_created_at,
+            file_modified_at=inventory.file_modified_at,
+        )
+        db.add(file)
+        _write_event(
+            db, scan_id=candidate.scan_id, file_id=file_id, event_type="added",
+            from_path=None, to_path=inventory.full_path,
+            from_hash=None, to_hash=candidate.candidate_hash, match_method="text_similarity_user",
+        )
+        ingest_job = Job(type="ingest", file_id=file_id, parent_job_id=candidate.scan_id, trigger="scan")
+        db.add(ingest_job)
+        candidate.status = "rejected"
+
+    candidate.resolved_at = now
+    db.commit()
+    db.refresh(file)
+    db.refresh(ingest_job)
+    return file, ingest_job

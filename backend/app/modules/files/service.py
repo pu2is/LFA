@@ -46,6 +46,10 @@ def get_path(db: Session, path_id: uuid.UUID) -> RegisteredPath | None:
     return db.get(RegisteredPath, path_id)
 
 
+def get_file(db: Session, file_id: uuid.UUID) -> File | None:
+    return db.get(File, file_id)
+
+
 def list_paths(db: Session) -> list[RegisteredPath]:
     return list(db.scalars(select(RegisteredPath)))
 

@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Select, func, literal_column, select, tuple_
+from sqlalchemy import Select, delete, func, literal_column, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -73,6 +73,22 @@ def get_files_with_type_or_tag_labels(db: Session, file_ids: list[uuid.UUID]) ->
     typed = set(db.scalars(select(TypeLabelFile.file_id).where(TypeLabelFile.file_id.in_(file_ids))))
     tagged = set(db.scalars(select(TagLabel.file_id).where(TagLabel.file_id.in_(file_ids))))
     return typed | tagged
+
+
+def clear_all_labels(db: Session, file_id: uuid.UUID) -> None:
+    """Delete every type_labels_files/tag_labels row for `file_id`, regardless
+    of status (ADR-0001b D4/D5: a Rescan-driven `drop` decision, not the
+    normal append-only lifecycle). Must include `rejected` rows -- routing in
+    get_files_with_type_or_tag_labels only checks row presence, not status, so
+    a leftover rejected row would misroute the next labeling call into
+    augment instead of initial (see docs/workflow/01d-path-rescan.md).
+
+    Does not commit: both callers (candidate drop_labels, file label-review
+    drop) fold this into one larger atomic mutation alongside a status/flag
+    update, same as apply_diff's "caller commits once" convention.
+    """
+    db.execute(delete(TypeLabelFile).where(TypeLabelFile.file_id == file_id))
+    db.execute(delete(TagLabel).where(TagLabel.file_id == file_id))
 
 
 def get_files_with_incomplete_initial_job(db: Session, file_ids: list[uuid.UUID]) -> set[uuid.UUID]:

@@ -111,6 +111,14 @@ def iter_inventory(
         yield _describe_cheap(path)
 
 
+def describe_inventory_entry(path: Path) -> InventoryEntry:
+    """Single-file cheap stat (no hash) -- same shape iter_inventory yields
+    per file, for re-verifying one candidate path without a directory walk
+    (Rescan candidate resolution, ADR-0001b D5).
+    """
+    return _describe_cheap(path)
+
+
 def compute_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
