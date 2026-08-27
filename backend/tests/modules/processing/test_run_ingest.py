@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from app.modules.files.models import File
 from app.modules.processing.extraction import ExtractionResult
 from app.modules.processing.service import run_ingest
 from tests.factories import make_failed_job
@@ -28,3 +29,20 @@ def test_run_ingest_clears_stale_error_message_on_success(mock_extract, mock_chu
     assert ingest_job_result.error_message is None
     assert embed_job is not None
     mock_chunk_and_store.assert_called_once()
+
+
+@patch("app.modules.processing.service.rag_service.chunk_and_store")
+@patch("app.modules.processing.service.extraction.extract_text")
+def test_run_ingest_persists_text_signature(mock_extract, mock_chunk_and_store, db, ingest_job):
+    """WF1b/ADR-0001b D3: new ingests must start writing files.text_signature
+    so a later Rescan can use it for fuzzy recovery (#66)."""
+    mock_extract.return_value = ExtractionResult(
+        text="A reasonably long piece of extracted document text for signing.", ocr_applied=False
+    )
+    mock_chunk_and_store.return_value = []
+
+    _ingest_job_result, _embed_job = run_ingest(db, ingest_job.id)
+
+    file = db.get(File, ingest_job.file_id)
+    assert file.text_signature is not None
+    assert len(file.text_signature) == 16

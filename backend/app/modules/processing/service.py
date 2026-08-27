@@ -8,6 +8,7 @@ from app.modules.jobs.models import Job
 from app.modules.jobs.service import mark_failed, mark_progress, mark_running, mark_succeeded
 from app.modules.processing import cleaning, extraction
 from app.modules.rag import service as rag_service
+from app.modules.scans import text_signature
 
 
 def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
@@ -43,6 +44,7 @@ def run_ingest(db: Session, job_id: uuid.UUID) -> tuple[Job, Job | None]:
     mark_progress(db, job)
 
     cleaned_text = cleaning.clean(result.text)
+    file.text_signature = text_signature.compute_text_signature(cleaned_text)
 
     job.stage = "chunk"
     mark_progress(db, job)

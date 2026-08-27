@@ -1,11 +1,15 @@
-"""Tests for the Rescan inventory/diff/matching engine (WF1b, ADR-0001b D2/D3, #65)."""
+"""Tests for the Rescan inventory/diff/matching engine (WF1b, ADR-0001b D2/D3,
+#65 deterministic matching + #66 fuzzy recovery)."""
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from app.modules.files.models import File, RegisteredPath
+from app.modules.processing.extraction import ExtractionResult
 from app.modules.scans import discovery, rescan
+from app.modules.scans.text_signature import compute_text_signature
 
 
 def _register(db, path: Path, parent: RegisteredPath | None = None) -> RegisteredPath:
@@ -27,6 +31,7 @@ def _make_file(
     file_created_at: datetime | None = None,
     fs_device_id: str | None = None,
     fs_file_id: str | None = None,
+    text_signature: str | None = None,
 ) -> File:
     file = File(
         path_id=path_id,
@@ -39,6 +44,7 @@ def _make_file(
         file_modified_at=file_modified_at,
         fs_device_id=fs_device_id,
         fs_file_id=fs_file_id,
+        text_signature=text_signature,
     )
     db.add(file)
     db.commit()
@@ -315,3 +321,219 @@ def test_build_inventory_raises_on_any_unreadable_root(db, tmp_path):
 
     with pytest.raises(OSError):
         rescan.build_inventory([good_path, bad_path])
+
+
+# --- Fuzzy recovery (#66, ADR-0001b D3 step 5 / D5) ---------------------
+#
+# All comparisons in these tests are against _TINY_EDIT_TEXT (what the mocked
+# extraction returns for the added file), and similarity scores below are
+# measured relative to it, not to _ORIGINAL_TEXT -- SimHash similarity isn't
+# transitive, so this matters. Chosen so their pairwise similarity to
+# _TINY_EDIT_TEXT spreads out enough to exercise threshold and margin
+# decisions deterministically (see text_signature.SIMILARITY_THRESHOLD=0.90,
+# UNIQUENESS_MARGIN=0.05):
+#   _ORIGINAL_TEXT             ~0.953 (single number changed, in reverse)
+#   _CLOSE_SECOND_EDIT_TEXT    ~0.938 (a different single phrase changed)
+#   _TWO_SENTENCE_EDIT_TEXT    ~0.797 (two sentences rewritten)
+#   _REWRITTEN_TEXT            ~0.5   (unrelated content)
+_ORIGINAL_TEXT = (
+    "Invoice Number 2024-001. This invoice covers consulting services rendered\n"
+    "during the month of January 2024 for the engineering department. Services included\n"
+    "system architecture review, code quality audits, and mentoring of junior developers.\n"
+    "The total amount due for these services is 1500 EUR, payable within thirty days of\n"
+    "the invoice date. Please remit payment to the account listed below."
+)
+_TINY_EDIT_TEXT = _ORIGINAL_TEXT.replace("1500 EUR", "1550 EUR")
+_CLOSE_SECOND_EDIT_TEXT = _ORIGINAL_TEXT.replace("code quality audits", "code review sessions")
+_ONE_SENTENCE_EDIT_TEXT = _ORIGINAL_TEXT.replace(
+    "Please remit payment to the account listed below.",
+    "Kindly wire the funds to our updated banking details as soon as possible, thank you very much indeed.",
+)
+_TWO_SENTENCE_EDIT_TEXT = _ONE_SENTENCE_EDIT_TEXT.replace(
+    "Services included\nsystem architecture review, code quality audits, and mentoring of junior developers.",
+    "Work performed spanned infrastructure planning, security assessments, and onboarding support for new hires.",
+)
+_REWRITTEN_TEXT = (
+    "A completely different summary of unrelated project work delivered in early 2024 for a "
+    "separate client engagement, covering topics such as data migration and vendor negotiation, "
+    "follow-up sessions scheduled for next quarter as needed."
+)
+
+
+def _mock_extract_text(text: str):
+    return patch(
+        "app.modules.scans.rescan.extraction.extract_text",
+        return_value=ExtractionResult(text=text, ocr_applied=False),
+    )
+
+
+def test_diff_inventory_creates_fuzzy_candidate_for_unique_above_threshold_match(db, tmp_path):
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    missing = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "old_name.pdf",
+        file_hash="old-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_ORIGINAL_TEXT),
+    )
+
+    with _mock_extract_text(_TINY_EDIT_TEXT):
+        diff = rescan.diff_inventory(_inventory(registered_path), [missing])
+
+    assert len(diff.fuzzy_candidates) == 1
+    candidate = diff.fuzzy_candidates[0]
+    assert candidate.missing_file.id == missing.id
+    assert candidate.inventory.full_path == str(added_path)
+    assert candidate.similarity_score == pytest.approx(0.953125)
+    assert not diff.added  # claimed by the fuzzy candidate, not left as `added`
+    assert [m.file.id for m in diff.missing] == [missing.id]  # stays missing while pending (D5)
+
+
+def test_diff_inventory_no_fuzzy_candidate_when_metadata_narrowing_finds_nothing(db, tmp_path):
+    """Wrong file_type is enough to exclude a metadata candidate, regardless
+    of text similarity -- extraction should never even run."""
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    missing = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "old_name.docx",
+        file_hash="old-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_ORIGINAL_TEXT),
+    )
+
+    with _mock_extract_text(_TINY_EDIT_TEXT) as mock_extract:
+        diff = rescan.diff_inventory(_inventory(registered_path), [missing])
+        mock_extract.assert_not_called()
+
+    assert not diff.fuzzy_candidates
+    assert len(diff.added) == 1
+    assert [m.file.id for m in diff.missing] == [missing.id]
+
+
+def test_diff_inventory_no_fuzzy_candidate_when_below_similarity_threshold(db, tmp_path):
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    missing = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "old_name.pdf",
+        file_hash="old-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_ORIGINAL_TEXT),
+    )
+
+    with _mock_extract_text(_REWRITTEN_TEXT):
+        diff = rescan.diff_inventory(_inventory(registered_path), [missing])
+
+    assert not diff.fuzzy_candidates
+    assert len(diff.added) == 1
+    assert [m.file.id for m in diff.missing] == [missing.id]
+
+
+def test_diff_inventory_no_fuzzy_candidate_when_no_extractable_text(db, tmp_path):
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    missing = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "old_name.pdf",
+        file_hash="old-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_ORIGINAL_TEXT),
+    )
+
+    with patch(
+        "app.modules.scans.rescan.extraction.extract_text",
+        side_effect=RuntimeError("no text layer and OCR disabled"),
+    ):
+        diff = rescan.diff_inventory(_inventory(registered_path), [missing])
+
+    assert not diff.fuzzy_candidates
+    assert len(diff.added) == 1
+
+
+def test_diff_inventory_creates_fuzzy_candidate_when_best_match_clears_uniqueness_margin(db, tmp_path):
+    """Regression test (uniqueness margin, clear-winner side): metadata
+    narrowing finds two missing candidates, but one is a much closer text
+    match than the other -- the winner must clear the runner-up by at least
+    UNIQUENESS_MARGIN, which it does here (~0.953 vs ~0.813)."""
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    close_match = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "close.pdf",
+        file_hash="close-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_ORIGINAL_TEXT),
+    )
+    far_match = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "far.pdf",
+        file_hash="far-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_TWO_SENTENCE_EDIT_TEXT),
+    )
+
+    with _mock_extract_text(_TINY_EDIT_TEXT):
+        diff = rescan.diff_inventory(_inventory(registered_path), [close_match, far_match])
+
+    assert len(diff.fuzzy_candidates) == 1
+    assert diff.fuzzy_candidates[0].missing_file.id == close_match.id
+    assert not diff.added
+    assert {m.file.id for m in diff.missing} == {close_match.id, far_match.id}
+
+
+def test_diff_inventory_no_fuzzy_candidate_when_top_two_matches_are_within_uniqueness_margin(db, tmp_path):
+    """Regression test (uniqueness margin, ambiguous side): two missing
+    candidates both score above SIMILARITY_THRESHOLD, but too close to each
+    other (~0.953 vs ~0.938, under UNIQUENESS_MARGIN=0.05 apart) to trust
+    either one -- must produce no candidate rather than guess."""
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    candidate_a = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "a.pdf",
+        file_hash="a-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_ORIGINAL_TEXT),
+    )
+    candidate_b = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "b.pdf",
+        file_hash="b-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=compute_text_signature(_CLOSE_SECOND_EDIT_TEXT),
+    )
+
+    with _mock_extract_text(_TINY_EDIT_TEXT):
+        diff = rescan.diff_inventory(_inventory(registered_path), [candidate_a, candidate_b])
+
+    assert not diff.fuzzy_candidates
+    assert len(diff.added) == 1
+    assert {m.file.id for m in diff.missing} == {candidate_a.id, candidate_b.id}
+
+
+def test_diff_inventory_no_fuzzy_candidate_when_missing_file_has_no_text_signature(db, tmp_path):
+    """Bootstrap/legacy case (issue #66 scope): a missing file ingested
+    before this feature has text_signature=NULL and must be silently
+    excluded from comparison, not treated as a match or a crash."""
+    registered_path = _register(db, tmp_path)
+    added_path = tmp_path / "new_name.pdf"
+    added_path.write_bytes(b"x" * 1000)
+
+    missing = _make_file(
+        db, path_id=registered_path.id, full_path=tmp_path / "old_name.pdf",
+        file_hash="old-hash", file_size=1000,
+        file_modified_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        text_signature=None,
+    )
+
+    with _mock_extract_text(_TINY_EDIT_TEXT):
+        diff = rescan.diff_inventory(_inventory(registered_path), [missing])
+
+    assert not diff.fuzzy_candidates
+    assert len(diff.added) == 1

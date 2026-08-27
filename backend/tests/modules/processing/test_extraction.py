@@ -84,6 +84,23 @@ class TestOcrFallback:
         assert result.ocr_applied is True
         assert result.text == ocr_text
 
+    def test_ocr_skipped_and_raises_when_use_ocr_false(self, tmp_path):
+        """Rescan's fuzzy-recovery text-signature step passes use_ocr=False
+        (ADR-0001b D3: never escalate to OCR during Rescan)."""
+        pdf = tmp_path / "scanned.pdf"
+        pdf.write_bytes(b"fake")
+
+        mock_cls = MagicMock()
+        mock_cls.return_value.load.return_value = [MagicMock(page_content="hi")]
+
+        with (
+            patch.dict(extraction._LOADERS, {"pdf": mock_cls}),
+            patch("app.modules.processing.extraction._extract_pdf_with_ocr") as mock_ocr,
+        ):
+            with pytest.raises(RuntimeError, match="OCR is disabled"):
+                extract_text(pdf, "pdf", use_ocr=False)
+            mock_ocr.assert_not_called()
+
     def test_ocr_not_triggered_when_text_meets_threshold(self, tmp_path):
         pdf = tmp_path / "text.pdf"
         pdf.write_bytes(b"fake")

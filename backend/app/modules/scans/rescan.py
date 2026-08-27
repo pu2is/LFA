@@ -1,8 +1,7 @@
 """Pure inventory/diff/matching engine for Global Rescan (WF1b, ADR-0001b
 D2/D3). Produces an in-memory classification of the full filesystem
 inventory against the current `files` manifest -- no database writes here;
-applying the result to `files`/`file_events` is #67, fuzzy recovery for
-whatever is left unmatched is #66.
+applying the result to `files`/`file_events`/`file_match_candidates` is #67.
 """
 
 import uuid
@@ -12,7 +11,16 @@ from datetime import datetime
 from pathlib import Path
 
 from app.modules.files.models import File, RegisteredPath
-from app.modules.scans import discovery
+from app.modules.processing import cleaning, extraction
+from app.modules.scans import discovery, text_signature
+
+# ADR-0001b D3 step 5, metadata narrowing: how far a candidate's file_size may
+# be from the added file's size before it is cheap-filtered out, pre-text-
+# extraction. Deliberately generous -- this only bounds how many candidates
+# get their text extracted/compared, not the actual match decision (that is
+# text_signature.SIMILARITY_THRESHOLD/UNIQUENESS_MARGIN).
+MIN_SIZE_RATIO = 0.5
+MAX_SIZE_RATIO = 2.0
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,18 @@ class AddedFile:
 
 
 @dataclass(frozen=True)
+class FuzzyCandidate:
+    """Pending recovery proposal (ADR-0001b D5) -- shaped after
+    file_match_candidates' columns, minus the ones only Apply (#67) can
+    assign (id, scan_id, status, timestamps). Never auto-applied."""
+
+    missing_file: File
+    inventory: InventoryFile
+    candidate_hash: str
+    similarity_score: float
+
+
+@dataclass(frozen=True)
 class RescanDiff:
     unchanged: list[UnchangedFile]
     metadata_refreshed: list[MetadataRefreshed]
@@ -128,14 +148,15 @@ class RescanDiff:
     moved_modified: list[MovedModifiedFile]
     missing: list[MissingFile]
     added: list[AddedFile]
+    fuzzy_candidates: list[FuzzyCandidate]
 
 
 def diff_inventory(inventory: list[InventoryFile], current_files: list[File]) -> RescanDiff:
     """Classify `inventory` against `current_files` per ADR-0001b D3's cost-
-    ordered matching ladder (steps 1-4 and 6 -- fuzzy recovery, step 5, is
-    #66). Hashing happens on demand via discovery.hash_with_retry, only for
-    files whose cheap metadata changed or that are move candidates; an
-    UnstableFileError propagates to fail the whole Rescan (D2).
+    ordered matching ladder (steps 1-6). Hashing happens on demand via
+    discovery.hash_with_retry, only for files whose cheap metadata changed or
+    that are move candidates; an UnstableFileError propagates to fail the
+    whole Rescan (D2).
     """
     inventory_by_path = {entry.full_path: entry for entry in inventory}
     current_by_path = {file.full_path: file for file in current_files}
@@ -174,6 +195,12 @@ def diff_inventory(inventory: list[InventoryFile], current_files: list[File]) ->
     _match_by_identity(missing_pool, added_pool, added_hashes, moved, moved_modified)
     _match_by_hash(missing_pool, added_pool, added_hashes, moved)
 
+    # Step 5: fuzzy recovery. Pops matched entries from added_pool (no file
+    # row is created for a pending candidate -- D5), but never from
+    # missing_pool: the missing file stays `missing` while pending, and may
+    # be the target of more than one candidate.
+    fuzzy_candidates = _match_fuzzy_candidates(missing_pool, added_pool, added_hashes)
+
     missing = [MissingFile(file=file) for file in missing_pool.values()]
     added = [
         AddedFile(inventory=entry, file_hash=added_hashes[path])
@@ -186,6 +213,7 @@ def diff_inventory(inventory: list[InventoryFile], current_files: list[File]) ->
         modified=modified,
         moved=moved,
         moved_modified=moved_modified,
+        fuzzy_candidates=fuzzy_candidates,
         missing=missing,
         added=added,
     )
@@ -256,3 +284,83 @@ def _match_by_hash(
         path = added_paths[0]
         entry = added_pool.pop(path)
         moved.append(MovedFile(file=file, inventory=entry, match_method="hash"))
+
+
+def _size_compatible(candidate_size: int, reference_size: int) -> bool:
+    """ADR-0001b D3 step 5 metadata narrowing: is `candidate_size` within
+    [MIN_SIZE_RATIO, MAX_SIZE_RATIO] of `reference_size`? A zero-byte
+    reference only matches other zero-byte files (the ratio is undefined)."""
+    if reference_size == 0:
+        return candidate_size == 0
+    ratio = candidate_size / reference_size
+    return MIN_SIZE_RATIO <= ratio <= MAX_SIZE_RATIO
+
+
+def _match_fuzzy_candidates(
+    missing_pool: dict[uuid.UUID, File],
+    added_pool: dict[str, InventoryFile],
+    added_hashes: dict[str, str],
+) -> list[FuzzyCandidate]:
+    """ADR-0001b D3 step 5 / D5: for each still-unmatched added file, narrow
+    missing_pool by file_type + size range, then compare normalized-text
+    SimHash only against that narrowed set -- never against the full
+    missing_pool, and never via OCR/embedding/LLM (D3).
+
+    A single narrowed candidate only needs to clear SIMILARITY_THRESHOLD.
+    Multiple narrowed candidates additionally need the top score to beat the
+    runner-up by UNIQUENESS_MARGIN, or the match is ambiguous and dropped.
+    Matched added entries are popped from added_pool (no file row is created
+    for a pending candidate -- D5); missing_pool is left untouched, since the
+    missing file stays `missing` while the candidate is pending and may end
+    up targeted by more than one candidate.
+    """
+    candidates: list[FuzzyCandidate] = []
+
+    for path, entry in list(added_pool.items()):
+        metadata_matches = [
+            file
+            for file in missing_pool.values()
+            if file.file_type == entry.file_type and _size_compatible(entry.file_size, file.file_size)
+        ]
+        if not metadata_matches:
+            continue
+
+        try:
+            result = extraction.extract_text(entry.path, entry.file_type, use_ocr=False)
+        except Exception:
+            # No text layer, OCR disabled, unsupported type, or a loader
+            # choking on malformed content -- all are "no usable text" here
+            # (D3: stop, don't escalate), same broad catch run_ingest uses
+            # around this same call for the same reason.
+            continue
+        added_signature = text_signature.compute_text_signature(cleaning.clean(result.text))
+        if added_signature is None:
+            continue
+
+        scored = sorted(
+            (
+                (file, text_signature.similarity(added_signature, file.text_signature))
+                for file in metadata_matches
+                if file.text_signature is not None
+            ),
+            key=lambda pair: pair[1],
+            reverse=True,
+        )
+        if not scored:
+            continue
+
+        best_file, best_score = scored[0]
+        if best_score < text_signature.SIMILARITY_THRESHOLD:
+            continue
+        if len(scored) > 1 and (best_score - scored[1][1]) < text_signature.UNIQUENESS_MARGIN:
+            continue  # ambiguous: metadata narrowed to >1, and text didn't clearly pick a winner
+
+        added_pool.pop(path)
+        candidates.append(FuzzyCandidate(
+            missing_file=best_file,
+            inventory=entry,
+            candidate_hash=added_hashes[path],
+            similarity_score=best_score,
+        ))
+
+    return candidates

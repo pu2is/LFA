@@ -133,11 +133,14 @@ def _extract_pdf_with_ocr(path: Path) -> str:
     return chinese.text if len(chinese.text.strip()) > len(latin.text.strip()) else latin.text
 
 
-def extract_text(path: Path, file_type: str) -> ExtractionResult:
+def extract_text(path: Path, file_type: str, *, use_ocr: bool = True) -> ExtractionResult:
     """Return the full text of a document.
 
     For PDFs whose text layer is below OCR_THRESHOLD characters, falls back to
-    EasyOCR and sets ocr_applied=True on the result.
+    EasyOCR and sets ocr_applied=True on the result -- unless use_ocr=False, in
+    which case a thin text layer raises instead of escalating to OCR. Rescan's
+    fuzzy-recovery text-signature step (ADR-0001b D3) passes use_ocr=False:
+    Rescan must stay on deterministic/cheap matching and never upgrade to OCR.
     Raises RuntimeError when no usable text can be extracted after all fallbacks.
     Raises KeyError for unrecognised file_type values.
     """
@@ -153,6 +156,8 @@ def extract_text(path: Path, file_type: str) -> ExtractionResult:
     text = "\n".join(p.page_content for p in pages)
 
     if file_type == "pdf" and len(text.strip()) < OCR_THRESHOLD:
+        if not use_ocr:
+            raise RuntimeError(f"No text layer available for {path.name} and OCR is disabled.")
         ocr_text = _extract_pdf_with_ocr(path)
         if not ocr_text.strip():
             raise RuntimeError(
